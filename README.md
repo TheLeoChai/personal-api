@@ -89,6 +89,10 @@ docker build -t server-app /volume1/projects/personal-api/src    # tag must matc
 # the prod compose file at /home/mihu/Server is the cleanest way:
 #   cd /home/mihu/Server && docker compose up -d --build app worker
 # )
+
+# apply pending migrations to the live DB (see migrations/):
+#   migrations/0001_fix_posts_updated_at.sql — required, POST /api/posts
+#   is broken on the live DB without it (NotNullViolation on updated_at)
 ```
 
 - Caddy routing and uploads/scripts bind mounts need **no changes** — source

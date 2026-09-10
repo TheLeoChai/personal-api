@@ -30,7 +30,11 @@ class Post(Base):
     body_md: Mapped[str] = mapped_column(Text)
     # Mapped[...] should use Python types (datetime), not SQLAlchemy types
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, onupdate=func.now())
+    # server_default needed: onupdate only fires on UPDATE; without a default,
+    # INSERT fails with NotNullViolation (this broke POST /api/posts in prod)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Album(Base):
