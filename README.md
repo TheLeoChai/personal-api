@@ -1,95 +1,100 @@
 # personal-api
 
 Source of truth for the **Personal API** — the FastAPI backend live at
-**https://api.leochai.com**. Serves content (posts, photo albums, run log)
-for [leochai.com](https://github.com/TheLeoChai/leochai-website).
+**https://api.leochai.com**. Serves content (posts, photo albums, script
+runner) for [leochai.com](https://github.com/TheLeoChai/leochai-website).
 
 ## Status
 
-- 🔴 **Source code not recovered yet** — the running container predates this
-  repo and its code lives inside the root-only Docker stack on the NAS.
-  See [`RECOVERY.md`](RECOVERY.md) for the exact extraction steps.
-- ✅ **API contract captured** — [`openapi.json`](openapi.json) (snapshot of
-  the live service, 2026-09-10). Frontend work can proceed against the live
-  URL meanwhile.
+- ✅ **Source recovered 2026-09-10** from the live container into [`src/`](src/)
+  (see [`RECOVERY.md`](RECOVERY.md) for the history).
+- ✅ Contract: [`openapi.json`](openapi.json) matches the live service.
 
 ## Architecture
 
 ```
-                    Cloudflare DNS (DDNS-managed A record)
-                             │
-                    https://api.leochai.com :443
-                             │
-                       ┌─────▼─────┐
-                       │   Caddy   │  TLS (auto Let's Encrypt)
-                       └─────┬─────┘
-                             │
-   ┌─────────────┬───────────▼──────────┬──────────────┐
-   │             │                      │              │
-┌──▼───┐   ┌────▼────┐   ┌─────────┐   ┌──▼───┐   ┌──────▼─────┐
-│  api │   │ postgres│   │  redis  │   │worker│   │ openvpn-as │
-│ :8081│   │ (personal)│  │  :6379  │   │      │   │ (separate) │
-└──────┘   └─────────┘   └─────────┘   └──────┘   └────────────┘
-  FastAPI      db: personal   cache/queue   background   vpn.leochai.com
+                 Cloudflare DNS (DDNS-managed A record)
+                          │
+                 https://api.leochai.com :443
+                          │
+                    ┌─────▼─────┐
+                    │   Caddy   │ TLS via Cloudflare DNS-01
+                    │  /media/* → file_server (uploads)
+                    └─────┬─────┘
+                          │ http://app:8000
+   ┌──────────┬───────────▼───────┬─────────────┐
+   │          │                   │             │
+┌──▼───┐  ┌───▼────┐   ┌──────────┐  │         ┌───▼────┐
+│ app  │  │ postgres│  │  redis   │  │         │ worker │
+│:8000 │  │    :5432│  │   :6379  │  │         │ (RQ)   │
+└──────┘  └────────┘   └──────────┘  │         └────────┘
+  FastAPI     db: personal   RQ broker            runs /app/scripts/*.py
 ```
 
-API container runs `uvicorn app.main:app --host 0.0.0.0 --port 8081`
-(python 3.11). Full NAS infra: [leochai-website `docs/infra.md`](https://github.com/TheLeoChai/leochai-website/blob/main/docs/infra.md).
+Production runs on the NAS as compose project `server` (root-owned
+`/home/mihu/Server`) — full reference: [`docs/prod-stack.md`](docs/prod-stack.md).
+NAS-wide infra (DNS, DDNS, Caddy, VPN): [leochai-website `docs/infra.md`](https://github.com/TheLeoChai/leochai-website/blob/main/docs/infra.md).
 
-## API surface (from live contract)
+## Code layout
+
+```
+src/            FastAPI app (main.py) + SQLAlchemy models + RQ worker entry
+src/scripts/    Scripts executable via POST /api/run (bind-mounted in prod)
+src/uploads/    Photo storage — bind-mounted in prod, gitignored
+openapi.json    API contract snapshot
+docs/           prod-stack.md, schema.sql, caddy/Caddyfile reference
+```
+
+## API surface
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/api/posts` | — | list posts |
-| POST | `/api/posts` | bearer | create post (`title`, `body_md`) |
-| GET/PUT/DELETE | `/api/posts/{slug}` | — / bearer / bearer | read / update / delete post |
-| GET/POST | `/api/albums` | — / bearer | list / create album (`title`, `description`) |
-| POST | `/api/albums/{album_id}/photos` | bearer | add photo |
-| POST | `/api/run` | — | run log entry |
+| GET | `/api/posts/{slug}` | — | read post (`body_md`) |
+| POST | `/api/posts` | bearer | create post (`title`, `body_md` form fields) |
+| PUT/DELETE | `/api/posts/{slug}` | bearer | update / delete |
+| GET/POST | `/api/albums` | — / bearer | list / create album |
+| GET/POST | `/api/albums/{id}/photos` | — / bearer | photos (multipart `file` + `caption`); URLs point to `/media/*` |
+| POST | `/api/run` | bearer | run `src/scripts/<script>.py` sync or queued (`mode: "queue"`) |
 
-Interactive docs: https://api.leochai.com/docs
+Bearer = `Authorization: Bearer $ADMIN_TOKEN`. Interactive docs:
+https://api.leochai.com/docs
 
 ## Develop
 
-Local stack via Docker Compose (postgres + redis provided; `api` service
-activates once `src/` exists):
-
 ```bash
-cp .env.example .env          # fill in secrets (never commit .env)
-docker compose up -d          # postgres + redis
-# after recovery, with src/ present:
-docker compose --profile app up --build
-uvicorn app.main:app --reload --port 8081   # or run directly
+cp .env.example .env             # set ADMIN_TOKEN etc.
+docker compose up -d --build     # app on :8000, db :5432, worker
+open http://localhost:8000/docs
 ```
 
-- API contract is the source of truth for behavior: keep
-  [`openapi.json`](openapi.json) updated when endpoints change
-  (`curl -s localhost:8081/openapi.json > openapi.json`).
-- Bearer token for write endpoints comes from env — see `.env.example`.
+- Tables auto-create on startup; a schema snapshot is in
+  [`docs/schema.sql`](docs/schema.sql) for reference.
+- Frontend (leochai-website) can point at this local stack or the live URL.
+- Contract changes: update `openapi.json`
+  (`curl -s localhost:8000/openapi.json > openapi.json`) and commit together
+  with the code change.
 
-## Deploy (push updates to the NAS)
+## Deploy (push updates to the live NAS)
 
-The live stack is root-owned Docker on `kawaiinas`. Once `src/` is
-recovered and this repo is the build context:
+The prod compose project is root-owned at `/home/mihu/Server` — it stays the
+deployment home; **this repo is the source of truth for the code**.
 
 ```bash
-# on the NAS, as root
-cd /volume1/projects/personal-api
-docker build -t personal-api:latest ./src
-# recreate the api container with the same ports/env as today
-# (capture current definition first: RECOVERY.md step 1)
+# on the NAS (root, or as kimaki with docker group for the build part)
+cd /volume1/projects/personal-api && git pull
+docker build -t server-app /volume1/projects/personal-api/src    # tag must match prod image name
+
+# recreate the two app containers from the repo image (root:
+# the prod compose file at /home/mihu/Server is the cleanest way:
+#   cd /home/mihu/Server && docker compose up -d --build app worker
+# )
 ```
 
-- Caddy routing needs **no changes** — it proxies to the container port.
-- After deploying: `curl -s https://api.leochai.com/openapi.json | diff - openapi.json`
+- Caddy routing and uploads/scripts bind mounts need **no changes** — source
+  and scripts flow through the existing mounts.
+- Uploads live in `/home/mihu/Server/app/uploads` on the host — never wipe it.
+- After deploying:
+  `curl -s https://api.leochai.com/openapi.json | diff - openapi.json`
   should show only intended changes.
-- Rollback: retag previous image `personal-api:<hash>` and recreate.
-
-## Repository layout (once recovered)
-
-```
-src/            FastAPI application (app.main:app)
-openapi.json    API contract snapshot
-compose files   dev (this repo) + prod definition captured from the NAS
-docs/           runbooks, recovery, maintenance notes
-```
+- Rollback: `docker tag` previous image before rebuilding; recreate from it.

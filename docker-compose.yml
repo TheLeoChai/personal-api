@@ -1,10 +1,9 @@
-# Dev stack for personal-api.
-# postgres + redis are usable immediately; the `api` service activates
-# once src/ is recovered (see RECOVERY.md).
+# Local development stack — mirrors the live NAS topology
+# (compose project at /home/mihu/Server, root-owned; see docs/prod-stack.md)
 
 services:
-  postgres:
-    image: postgres:16-alpine
+  db:
+    image: postgres:16
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-personal}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-personal}
@@ -15,22 +14,33 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    image: redis:7
 
-  # Uncomment after `src/` exists:
-  # api:
-  #   build: ./src
-  #   environment:
-  #     DATABASE_URL: postgres://personal:personal@postgres:5432/personal
-  #     REDIS_URL: redis://redis:6379
-  #     API_BEARER_TOKEN: ${API_BEARER_TOKEN}
-  #   ports:
-  #     - "8081:8081"
-  #   depends_on:
-  #     - postgres
-  #     - redis
+  app:
+    build: ./src
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-personal}:${POSTGRES_PASSWORD:-personal}@db:5432/${POSTGRES_DB:-personal}
+      REDIS_URL: redis://redis:6379/0
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      PUBLIC_BASE: ${PUBLIC_BASE:-http://localhost:8000}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src/uploads:/app/uploads
+      - ./src/scripts:/app/scripts
+    depends_on:
+      - db
+      - redis
+
+  worker:
+    build: ./src
+    command: python worker.py
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
 
 volumes:
   pgdata:

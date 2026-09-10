@@ -1,6 +1,6 @@
 .env
-src/
 __pycache__/
 *.pyc
 .venv/
 pgdata/
+src/uploads/

@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy>=2
+psycopg[binary]
+alembic
+python-multipart
+Pillow
+pydantic
+redis
+rq
+python-jose[cryptography]
+passlib[bcrypt]
+python-slugify

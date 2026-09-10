@@ -1,0 +1,28 @@
+{$CADDY_API_DOMAIN} {
+    encode gzip
+
+    tls {
+        dns cloudflare {$CF_API_TOKEN}
+    }
+
+    # Serve static media directly (fast, cacheable)
+    handle_path /media/* {
+        root * {$CADDY_MEDIA_ROOT}
+        file_server
+    }
+
+    # Everything else -> FastAPI
+    reverse_proxy {$CADDY_API_UPSTREAM}
+}
+
+api.leochai.com:8443 {
+    tls {
+        dns cloudflare {$CF_API_TOKEN}
+    }
+
+    handle_path /xiaoesp/* {
+        reverse_proxy nas-ingest:8081
+    }
+
+    respond "not found" 404
+}

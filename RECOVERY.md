@@ -1,5 +1,10 @@
 # Recovering the live source into this repo
 
+> ✅ **DONE 2026-09-10.** kimaki was added to the docker group, source copied
+> from `server-app-1:/app` into `src/`, prod stack captured in
+> `docs/prod-stack.md`, schema in `docs/schema.sql`. Kept as the runbook for
+> future container-hosted services.
+
 The Personal API container was built outside any git repo and lives in the
 root-only Docker stack on the NAS (`kawaiinas`). The `kimaki` user cannot
 access the Docker socket, so these steps need **root** (or add `kimaki` to
