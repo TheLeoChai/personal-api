@@ -1,0 +1,36 @@
+# Dev stack for personal-api.
+# postgres + redis are usable immediately; the `api` service activates
+# once src/ is recovered (see RECOVERY.md).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-personal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-personal}
+      POSTGRES_DB: ${POSTGRES_DB:-personal}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  # Uncomment after `src/` exists:
+  # api:
+  #   build: ./src
+  #   environment:
+  #     DATABASE_URL: postgres://personal:personal@postgres:5432/personal
+  #     REDIS_URL: redis://redis:6379
+  #     API_BEARER_TOKEN: ${API_BEARER_TOKEN}
+  #   ports:
+  #     - "8081:8081"
+  #   depends_on:
+  #     - postgres
+  #     - redis
+
+volumes:
+  pgdata:
