@@ -1,8 +1,20 @@
-# Production stack reference (NAS, kawaiinas)
+## Production stack reference (NAS, kawaiinas)
 
 The live stack is a Docker Compose project rooted at **`/home/mihu/Server`**
-on the NAS (root-owned directory; `kimaki` has docker-group access to the
-containers but not to that folder). Captured 2026-09-10.
+on the NAS (root-only directory; the `kimaki` user has docker-group access —
+enough to manage containers, not to read that folder). Captured 2026-09-10.
+
+**Deploy state 2026-09-10:** `server-app-1` and `server-worker-1` were
+recreated by hand (not via compose) to ship the `updated_at` fix — the build
+context `/home/mihu/Server/app` was synced from this repo first, so a future
+root `docker compose up -d --build` rebuilds the same fixed code and adopts
+the containers cleanly. Rollback images pinned:
+`server-app:rollback-20260910` (sha256 00318e99…), `server-worker:rollback-20260910`.
+Full pre-change code backup: `/home/mihu/Server/rollback-20260910-app-code`.
+Migration `migrations/0001_fix_posts_updated_at.sql` was applied to the live
+DB (posts.updated_at now defaults to now()).
+CORS origins now include `theleochai.github.io`, `leochai.com`,
+`www.leochai.com`, `localhost:8080` and the current kimaki-tunnel dev origin.
 
 ## Containers (compose project `server`)
 
@@ -43,6 +55,15 @@ Docker named volumes: `server_caddy_config`, `server_caddy_data` (TLS certs).
 `DATABASE_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`,
 `REDIS_URL`, `CADDY_API_DOMAIN`, `CADDY_API_UPSTREAM`, `CADDY_MEDIA_ROOT`,
 `CADDY_NAS_DOMAIN`, `CADDY_NAS_UPSTREAM`, `CADDY_ACME_EMAIL`, `CF_API_TOKEN`
+
+## DDNS (found here 2026-09-10)
+
+The compose project defines two `oznu/cloudflare-ddns` updaters:
+`cf-ddns-api` (api.leochai.com) and `cf-ddns-nas` (nas.leochai.com).
+**Both have been `Exited (1)` for ~10 months** — yet the api record was
+updated 2026-09-03, so the working updater is something else (likely the
+UGOS built-in DDNS; identity unconfirmed). The `nas.leochai.com` record that
+was deleted from Cloudflare will not resurrect (its updater is dead).
 
 ## DB schema
 
