@@ -16,6 +16,8 @@ app = FastAPI(title="Personal API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in origins if o.strip()],
+    # kimaki tunnel dev URLs get a random subdomain per session
+    allow_origin_regex=r"https://[a-z0-9-]+\.kimaki\.dev",
     allow_methods=["*"],
     allow_headers=["*"],
 )

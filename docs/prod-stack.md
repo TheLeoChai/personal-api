@@ -13,8 +13,8 @@ the containers cleanly. Rollback images pinned:
 Full pre-change code backup: `/home/mihu/Server/rollback-20260910-app-code`.
 Migration `migrations/0001_fix_posts_updated_at.sql` was applied to the live
 DB (posts.updated_at now defaults to now()).
-CORS origins now include `theleochai.github.io`, `leochai.com`,
-`www.leochai.com`, `localhost:8080` and the current kimaki-tunnel dev origin.
+CORS origins include `theleochai.github.io`, `leochai.com`,
+`www.leochai.com`, `localhost:8080` `www.leochai.com` and `localhost:8080`; plus an `allow_origin_regex` for `*.kimaki.dev` tunnel dev URLs.
 
 ## Containers (compose project `server`)
 
