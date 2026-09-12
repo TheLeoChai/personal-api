@@ -24,14 +24,18 @@ schedules, or opinions.
 `supersede()`/`correct()` requires the registry's explicit
 `synthetic_authority_for_tests()` handle and returns a new registry snapshot.
 The old snapshot is unchanged; its current view excludes the superseded
-revision. This authority handle is a test seam, not launch approval. An owner
-approval service still needs to replace it before production integration.
+revision. This authority handle is a test seam, not launch approval. The
+marker and authority are trusted internal Python conventions, not a sandbox
+against arbitrary Python code. An owner approval service still needs to replace
+the helper before production integration.
 
 Visitor text is created with `visitor_item()` and remains `untrusted` in
-IMMEDIATE or MEDIUM state. A caller cannot promote text by setting a string
-label such as `approved`; approved context items can only be issued by the
-current registry snapshot. Arbitrary text is never parsed into biography or
-instructions.
+IMMEDIATE or MEDIUM state. The assembler rejects caller-supplied approved
+items; setting a string label such as `approved` does not make caller text
+eligible for assembly. The current registry snapshot supplies approved items
+to the assembler. Its Python marker is an internal convention, not a sandbox
+against arbitrary Python code. Arbitrary text is never parsed into biography
+or instructions.
 
 ## Layered assembly
 
@@ -48,10 +52,14 @@ IMMEDIATE ordering. Inputs are copied into tuples and are never mutated.
 
 Assembly requires an explicit `SyntheticVisibilityPolicy` made from exact
 `VisibilityGrant` values. There is no inferred public default. A private or
-resident item without a grant is omitted and never downgraded to public; the
-privacy-safe omission report contains only layer/reason/count, not private
-text or provenance. These policy helpers are synthetic fixtures for unit
-tests, not a privacy launch decision.
+resident optional item without a grant is omitted and never downgraded to
+public; a denied mandatory item raises the generic
+`MandatoryContextUnavailable` error before an envelope is returned. The error
+contains no denied value or metadata, and the optional privacy-safe omission
+report contains only layer/reason/count. These policy helpers are synthetic
+fixtures for unit tests, not a privacy launch decision. All supplied items must
+also match the registry resident; foreign records raise the generic
+`ResidentScopeError`, even if a synthetic grant exists.
 
 `ContextBudgets` supplies finite per-layer and total limits. The assembler
 checks item count and UTF-8 text size before invoking the injected

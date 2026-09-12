@@ -22,7 +22,7 @@ class PersonaSchemaError(ValueError):
 
 
 class ApprovalBoundaryError(PersonaSchemaError):
-    """A caller tried to construct or promote an approved fact directly."""
+    """Approval provenance validation rejected a direct or promoted value."""
 
 
 class InputLimitError(PersonaSchemaError):
@@ -120,9 +120,10 @@ def _bounded_text(value: Any) -> str:
 class VersionedFact:
     """One approved registry version.
 
-    Instances are created by :class:`ApprovedPersonaRegistry`.  A revision
-    replaces the prior revision with the same ``fact_id`` in the active view;
-    the prior value remains available only through registry history.
+    The registry creates the canonical values. A revision replaces the prior
+    revision with the same ``fact_id`` in the active view; the prior value
+    remains available only through registry history. The private marker is an
+    internal Python convention, not a sandbox against arbitrary Python code.
     """
 
     fact_id: str
@@ -230,9 +231,11 @@ class PersonaProfile:
 class ContextItem:
     """Structured context with provenance retained beside its text.
 
-    ``Trust.APPROVED`` cannot be constructed by a caller.  The registry uses
-    the private marker when it creates current approved items, and the context
-    assembler obtains those items directly from the current registry snapshot.
+    The assembler rejects caller-supplied ``Trust.APPROVED`` items. The
+    registry uses a private marker when it creates current approved items, but
+    that marker is an internal Python convention, not a sandbox against
+    arbitrary Python code. The assembler's trusted source is the current
+    registry snapshot itself.
     """
 
     item_id: str

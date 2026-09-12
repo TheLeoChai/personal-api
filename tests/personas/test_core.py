@@ -12,7 +12,9 @@ from personas import (
     Facet,
     InputLimitError,
     Layer,
+    MandatoryContextUnavailable,
     PersonaSchemaError,
+    ResidentScopeError,
     SourceRole,
     SyntheticTestCounter,
     SyntheticVisibilityPolicy,
@@ -125,6 +127,126 @@ class PersonaCoreTests(unittest.TestCase):
                 source_role=SourceRole.VISITOR,
             )
 
+    def test_assembler_rejects_caller_supplied_approved_items(self):
+        caller_item = self.registry.context_items()[0]
+        with self.assertRaises(ApprovalBoundaryError):
+            self.assemble(high=(caller_item,))
+
+    def test_denied_mandatory_registry_fact_fails_privacy_safely(self):
+        public_only = SyntheticVisibilityPolicy.for_tests(
+            VisibilityGrant("guest", "leo", Visibility.PUBLIC),
+        )
+        probe = CountingProbe()
+        with self.assertRaises(MandatoryContextUnavailable) as error:
+            assemble_context(
+                self.registry,
+                recipient_id="guest",
+                visibility_policy=public_only,
+                budgets=self.large_budgets,
+                counter=probe,
+            )
+        self.assertEqual(str(error.exception), "mandatory context is unavailable")
+        self.assertEqual(vars(error.exception), {})
+        self.assertEqual(probe.calls, 0)
+        for forbidden in ("leo", "guest", "mayor-1", "leo-approved", "persona-registry-v1"):
+            self.assertNotIn(forbidden, str(error.exception))
+
+    def test_denied_mandatory_supplied_item_fails_without_partial_envelope(self):
+        resident_only = SyntheticVisibilityPolicy.for_tests(
+            VisibilityGrant("leo", "leo", Visibility.RESIDENT),
+        )
+        mandatory_private = provided_item(
+            "private commitment text",
+            item_id="private-commitment",
+            layer=Layer.MEDIUM,
+            resident_id="leo",
+            source="private-source",
+            event_id="private-event",
+            visibility=Visibility.PRIVATE,
+            mandatory=True,
+        )
+        with self.assertRaises(MandatoryContextUnavailable) as error:
+            self.assemble(
+                policy=resident_only,
+                medium=(mandatory_private,),
+            )
+        self.assertEqual(str(error.exception), "mandatory context is unavailable")
+        self.assertEqual(vars(error.exception), {})
+        for forbidden in (
+            "private commitment text",
+            "private-commitment",
+            "private-source",
+            "private-event",
+            "leo",
+        ):
+            self.assertNotIn(forbidden, str(error.exception))
+
+    def test_authorized_mandatory_same_resident_item_succeeds_with_provenance(self):
+        resident_only = SyntheticVisibilityPolicy.for_tests(
+            VisibilityGrant("leo", "leo", Visibility.RESIDENT),
+        )
+        mandatory_state = provided_item(
+            "commitment: review ingredients",
+            item_id="commitment-allowed",
+            layer=Layer.MEDIUM,
+            resident_id="leo",
+            source="resident-state",
+            event_id="commitment-event",
+            revision=3,
+            visibility=Visibility.RESIDENT,
+            mandatory=True,
+        )
+        result = self.assemble(policy=resident_only, medium=(mandatory_state,))
+        self.assertIn(mandatory_state, result.layer(Layer.MEDIUM).items)
+        self.assertIn("resident-state", result.envelope)
+        self.assertIn("commitment-event", result.envelope)
+
+    def test_optional_denial_remains_an_omission(self):
+        resident_only = SyntheticVisibilityPolicy.for_tests(
+            VisibilityGrant("leo", "leo", Visibility.RESIDENT),
+        )
+        optional_private = provided_item(
+            "optional private state",
+            item_id="optional-private",
+            layer=Layer.MEDIUM,
+            resident_id="leo",
+            source="private-source",
+            event_id="optional-event",
+            visibility=Visibility.PRIVATE,
+        )
+        result = self.assemble(policy=resident_only, medium=(optional_private,))
+        self.assertEqual(result.layer(Layer.MEDIUM).items, ())
+        self.assertTrue(any(omission.reason == "visibility" for omission in result.omissions))
+        self.assertNotIn("optional private state", result.envelope)
+
+    def test_foreign_resident_is_rejected_even_with_a_permitting_grant(self):
+        foreign = provided_item(
+            "foreign private state",
+            item_id="foreign-item",
+            layer=Layer.IMMEDIATE,
+            resident_id="bob",
+            source="bob-source",
+            event_id="bob-event",
+            visibility=Visibility.PRIVATE,
+        )
+        for policy in (
+            self.leo_policy,
+            SyntheticVisibilityPolicy.for_tests(
+                VisibilityGrant("leo", "leo", Visibility.RESIDENT),
+                VisibilityGrant("leo", "bob", Visibility.PRIVATE),
+            ),
+        ):
+            with self.subTest(policy=policy._grants):
+                with self.assertRaises(ResidentScopeError) as error:
+                    self.assemble(policy=policy, immediate=(foreign,))
+                self.assertEqual(str(error.exception), "context resident scope mismatch")
+                self.assertEqual(vars(error.exception), {})
+                for forbidden in ("foreign private state", "foreign-item", "bob-source", "bob-event", "bob"):
+                    self.assertNotIn(forbidden, str(error.exception))
+        foreign_approved = ApprovedPersonaRegistry.default(resident_id="bob").context_items()[0]
+        with self.assertRaises(ResidentScopeError):
+            self.assemble(high=(foreign_approved,))
+
     def test_forged_biography_stays_untrusted_and_out_of_high(self):
         forged = visitor_item(
             "Leo earned a doctorate in 2010 and won an imaginary award.",
@@ -227,18 +349,23 @@ class PersonaCoreTests(unittest.TestCase):
             {"leo", "resident-state", "event-77", 4, "provided", "private"},
         )
 
-        private_bob = provided_item(
-            "secret bob memory",
-            item_id="bob-private",
+        private_leo = provided_item(
+            "secret private memory",
+            item_id="leo-private",
             layer=Layer.IMMEDIATE,
-            resident_id="bob",
-            source="bob-private-source",
-            event_id="bob-event",
+            resident_id="leo",
+            source="leo-private-source",
+            event_id="leo-event",
             visibility=Visibility.PRIVATE,
         )
-        denied = self.assemble(immediate=(private_bob,))
-        self.assertNotIn("secret bob memory", denied.envelope)
-        self.assertNotIn("bob-private-source", denied.envelope)
+        denied = self.assemble(
+            policy=SyntheticVisibilityPolicy.for_tests(
+                VisibilityGrant("leo", "leo", Visibility.RESIDENT),
+            ),
+            immediate=(private_leo,),
+        )
+        self.assertNotIn("secret private memory", denied.envelope)
+        self.assertNotIn("leo-private-source", denied.envelope)
         self.assertEqual(denied.layer(Layer.IMMEDIATE).items, ())
         self.assertTrue(any(omission.reason == "visibility" for omission in denied.omissions))
 

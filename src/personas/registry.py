@@ -1,9 +1,9 @@
 """Pure, immutable approved-persona registry.
 
-The registry is the only module that can issue approved fact values.  A
-correction returns a new registry snapshot, leaving the old snapshot and its
-inputs untouched.  No visitor text, model output, or persistent storage is
-accepted here.
+The registry API is the canonical issuer of approved fact values. A correction
+returns a new registry snapshot, leaving the old snapshot and its inputs
+untouched. No visitor text, model output, or persistent storage is accepted
+here.
 """
 
 from __future__ import annotations
@@ -27,11 +27,12 @@ class ApprovalRequired(ApprovalBoundaryError):
 
 
 class RegistryAuthority:
-    """Opaque handle used by explicit owner/test approval workflows.
+    """Internal-convention handle for explicit owner/test approval workflows.
 
-    The only way to obtain a handle in this slice is from a registry snapshot's
-    explicitly named synthetic test helper.  A future owner approval service
-    should replace that helper before launch.
+    Ordinary callers obtain a handle from a registry snapshot's explicitly
+    named synthetic test helper. This handle and its marker are trusted Python
+    conventions, not a sandbox against arbitrary Python code. A future owner
+    approval service should replace the helper before launch.
     """
 
     __slots__ = ("_marker",)

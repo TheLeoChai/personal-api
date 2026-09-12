@@ -27,6 +27,22 @@ from .schema import (
 )
 
 
+class MandatoryContextUnavailable(PermissionError):
+    """A mandatory item was denied by the supplied visibility policy."""
+
+    def __init__(self) -> None:
+        # Keep this message independent of the denied value and its metadata.
+        super().__init__("mandatory context is unavailable")
+
+
+class ResidentScopeError(PersonaSchemaError):
+    """A supplied item does not belong to the single resident envelope."""
+
+    def __init__(self) -> None:
+        # The resident identifiers are intentionally absent from the error.
+        super().__init__("context resident scope mismatch")
+
+
 class CountingContract(Protocol):
     """Injected counter for serialized units; this is not a model tokenizer."""
 
@@ -182,6 +198,7 @@ def _bounded_collection(
     values: Iterable[ContextItem],
     *,
     layer: Layer,
+    resident_id: str,
     max_items: int,
     max_item_text_bytes: int,
 ) -> tuple[ContextItem, ...]:
@@ -200,6 +217,8 @@ def _bounded_collection(
             raise InputLimitError(f"context item count exceeds {max_items}")
         if not isinstance(item, ContextItem):
             raise PersonaSchemaError("context inputs must be ContextItem values")
+        if item.resident_id != resident_id:
+            raise ResidentScopeError()
         if item.layer is not layer:
             raise PersonaSchemaError(
                 f"context item {item.item_id!r} is in {item.layer.value}, expected {layer.value}"
@@ -209,10 +228,6 @@ def _bounded_collection(
         if len(item.text.encode("utf-8")) > max_item_text_bytes:
             raise InputLimitError(
                 f"context item {item.item_id!r} exceeds {max_item_text_bytes} UTF-8 bytes"
-            )
-        if item.trust is Trust.APPROVED:
-            raise ApprovalBoundaryError(
-                "approved context inputs must be selected from the current registry"
             )
         collected.append(item)
     return tuple(collected)
@@ -346,8 +361,17 @@ def assemble_context(
         supplied[layer] = _bounded_collection(
             raw_by_layer[layer],
             layer=layer,
+            resident_id=registry.resident_id,
             max_items=budgets.max_items,
             max_item_text_bytes=budgets.max_item_text_bytes,
+        )
+
+    # This core emits one resident envelope.  The collection checks above run
+    # before policy selection or any counter/serialization work, even if a
+    # synthetic grant would otherwise permit a foreign item.
+    if any(item.trust is Trust.APPROVED for items in supplied.values() for item in items):
+        raise ApprovalBoundaryError(
+            "approved context inputs must be selected from the current registry"
         )
 
     approved = registry.context_items()
@@ -375,15 +399,17 @@ def assemble_context(
     omissions: list[Omission] = []
     for layer in (Layer.HIGH, Layer.MEDIUM, Layer.IMMEDIATE):
         for item in candidates[layer]:
-            if item.item_id in seen_ids:
-                raise PersonaSchemaError(f"duplicate context item id {item.item_id!r}")
-            seen_ids.add(item.item_id)
             allowed = visibility_policy.allows(item, recipient_id)
             if not isinstance(allowed, bool):
                 raise PersonaSchemaError("visibility policy must return boolean")
             if not allowed:
+                if item.mandatory:
+                    raise MandatoryContextUnavailable()
                 _new_omission(omissions, layer, "visibility")
                 continue
+            if item.item_id in seen_ids:
+                raise PersonaSchemaError(f"duplicate context item id {item.item_id!r}")
+            seen_ids.add(item.item_id)
             visible[layer].append(item)
 
     selected: dict[Layer, tuple[ContextItem, ...]] = {
