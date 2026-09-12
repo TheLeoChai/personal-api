@@ -743,7 +743,46 @@ class PostgresReservationStore:
                         ownership_version=record.ownership_version,
                     )
 
-                mutation(session, snapshot_from_record(record))
+                mutation_savepoint = session.begin_nested()
+                try:
+                    mutation(session, snapshot_from_record(record))
+                    # Flush while the savepoint is active so ORM target writes
+                    # are undone together with direct SQL writes below.
+                    session.flush()
+                except BaseException:
+                    mutation_savepoint.rollback()
+                    raise
+
+                # The callback may have waited or performed bounded database
+                # work. Re-sample after it returns so a result that crosses
+                # the inclusive idle boundary cannot commit its target.
+                completed_at = ensure_utc(self._clock(session))
+                if snapshot_from_record(record).is_expired(completed_at):
+                    mutation_savepoint.rollback()
+                    session.refresh(record)
+                    expired_event = self._reconcile_expiry(session, record, completed_at)
+                    if expired_event is None:
+                        raise RuntimeError("result expiry recheck lost the active reservation")
+                    operation = self._record_operation(
+                        session,
+                        kind=OperationKind.RESULT,
+                        resident_id=resident_id,
+                        idempotency_key=result_id,
+                        fingerprint=fingerprint,
+                        outcome=Outcome.EXPIRED,
+                        ownership_version=record.ownership_version,
+                        owner_id=None,
+                        accepted_at=None,
+                        event_id=expired_event.id,
+                    )
+                    return OperationResult(
+                        resident_id=resident_id,
+                        outcome=Outcome.EXPIRED,
+                        ownership_version=record.ownership_version,
+                        event_id=operation.event_id,
+                    )
+
+                mutation_savepoint.commit()
                 self._record_operation(
                     session,
                     kind=OperationKind.RESULT,

@@ -1,6 +1,6 @@
 # Conversation reservations: LEO-173 Luna trial
 
-Status: implementation complete for child ticket review, 2026-09-12. The
+Status: revision round 2 ready for child ticket review, 2026-09-12. The
 child is an isolated library trial. It does not add an HTTP route, change
 `openapi.json`, deploy anything, or implement LEO-135's parent endpoint.
 
@@ -70,18 +70,29 @@ linearize on one resident. A stale version or released state returns
 `invalid_capability`.
 
 `apply_result(..., mutation)` is the transaction-aware future integration seam.
-The store holds the same row lock while checking authorization and invokes the
-callback with the same SQLAlchemy session. A synthetic target can therefore be
-mutated only in the transaction that authorizes its owner/version. The callback
-must not commit or roll back. A callback exception rolls back the target and
-operation record together. No result mutation is attempted after expiry or a
-fence change.
+The store holds the resident row lock while checking authorization and invokes
+the callback with the same SQLAlchemy session inside a nested savepoint. When
+the callback returns, it samples the authoritative clock again. At the
+inclusive 300-second boundary it rolls back the savepoint, expires and fences
+the reservation, records the lifecycle event and `expired` result outcome, and
+commits no target mutation. A callback exception rolls back the target and
+operation record together. The callback must be database-only and must not
+commit, roll back, perform network/file/queue work, or cause other external
+side effects that a database savepoint cannot undo.
+
+The post-callback clock sample is the result transaction's authorization and
+linearization point. It prevents a callback that crosses the observed deadline
+from committing. PostgreSQL can still make a transaction visible after the
+sample because of commit latency when the final guard passed before the
+deadline; this library does not claim a physical wall-clock visibility bound
+after commit. Ownership changes remain serialized by the resident lock, and
+the 300-second rule is enforced at every result authorization point.
 
 ## Local tests
 
 The production `DATABASE_URL` is never read by the test suite. Without an
 explicit `LEO173_TEST_DATABASE_URL`, the three pure policy tests run and the
-eight PostgreSQL tests skip with an explicit reason.
+twelve PostgreSQL tests skip with an explicit reason.
 
 Install the declared dependencies into a disposable environment:
 
@@ -111,21 +122,29 @@ The fixture resets only that explicitly supplied test schema, executes
 metadata target used by fencing tests. It never imports production startup
 code. Remove only the verified test container after the run.
 
-Evidence from this implementation run:
+First-pass evidence, retained for calibration:
 
 - `/tmp/leo173-venv/bin/python -m pytest tests/conversations/test_domain.py -q` — 3 passed.
 - Without a database URL, `/tmp/leo173-venv/bin/python -m pytest -q` — 3 passed, 8 skipped with the documented explicit-URL reason.
-- Against the labeled localhost-only PostgreSQL 16 container — `11 passed in 2.35s`.
-- The PostgreSQL run included independent OS-process claim contention, restart/reopen and 299.999/300-second checks using an injected test clock, idempotency, forged/cross-resident capability rejection, delayed expiry reconciliation, durable event recovery, and a controlled result/goodbye lock race with rollback coverage.
+- Against the first-pass labeled localhost-only PostgreSQL 16 container — `11 passed in 2.35s`.
+
+Revision round 2 evidence:
+
+- `env -u LEO173_TEST_DATABASE_URL PYTHONDONTWRITEBYTECODE=1 /tmp/leo173-r2-venv/bin/python -m pytest -q -p no:cacheprovider` — 3 passed, 12 skipped.
+- Against a new bounded, labeled localhost-only PostgreSQL 16 container — `15 passed in 5.86s`. This includes independent OS-process claim contention, independent-process reopen before and after expiry with event recovery, time advanced between every non-renewing operation, an observed PostgreSQL lock wait, expiry/reclaim fencing, controlled result/goodbye overlap, savepoint rollback, and both injected and real database-clock callback expiry.
+- Independent probes derived from the supplied `/tmp/LEO173-review-evidence/test_review_probes.py` ideas, in a separate `/tmp/LEO173-r2-probes.py` — `2 passed in 4.56s`. Both the 299.999-to-300-second injected callback and the PostgreSQL-clock callback with 1.2 seconds of database sleep returned `expired` and left zero synthetic targets committed.
 
 ## Calibration and remaining limits
 
 Initial findings were a clean `main` at `05b4005`, synchronous SQLAlchemy with
 separate production engine initialization, no test harness, and no configured
-migration runner. No review findings or rework exist yet; independent
-Astra-high review is pending. The migration is authored and unapplied to
-live. No endpoint, OpenAPI, worker, compose, frontend, upload, NAS, or
-production configuration was changed.
+migration runner. The first independent review found and reproduced a
+post-callback expiry race and incomplete timing/restart evidence. Revision
+round 2 adds the nested-savepoint post-callback guard and the required
+regressions; the original first-pass report and commit remain unchanged for
+calibration. Independent Claude Opus 5 review is pending. The migration is
+authored and unapplied to live. No endpoint, OpenAPI, worker, compose,
+frontend, upload, NAS, or production configuration was changed.
 
 The future API still needs explicit decisions and integration for privacy and
 visibility, inference admission, reconnect/lost-capability policy, pause and

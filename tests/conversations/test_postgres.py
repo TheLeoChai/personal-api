@@ -10,7 +10,7 @@ import time
 import pytest
 from sqlalchemy import create_engine, text
 
-from conversations.domain import IdempotencyConflict, Outcome
+from conversations.domain import IDLE_TIMEOUT, IdempotencyConflict, Outcome
 from conversations.postgres import PostgresReservationStore
 
 
@@ -22,6 +22,38 @@ def claim_in_process(url: str, owner: str, barrier, output) -> None:
             "resident-process-contention", owner, f"claim-{owner}"
         )
         output.put(result.outcome.value)
+    finally:
+        engine.dispose()
+
+
+def reopen_in_process(url: str, action: str, capability: str, version: int, output) -> None:
+    engine = create_engine(url, pool_pre_ping=True)
+    try:
+        store = PostgresReservationStore(engine)
+        if action == "snapshot":
+            snapshot = store.snapshot("resident-reopen")
+            output.put(
+                {
+                    "state": snapshot.state,
+                    "version": snapshot.ownership_version,
+                    "events": len(store.events("resident-reopen")),
+                }
+            )
+            return
+        result = store.renew(
+            "resident-reopen",
+            "visitor-reopen",
+            capability,
+            version,
+            "reopen-expire",
+        )
+        output.put(
+            {
+                "outcome": result.outcome.value,
+                "version": result.ownership_version,
+                "events": len(store.events("resident-reopen")),
+            }
+        )
     finally:
         engine.dispose()
 
@@ -38,6 +70,39 @@ def target_count(engine) -> int:
         return connection.execute(
             text("SELECT count(*) FROM conversation_test_result_targets")
         ).scalar_one()
+
+
+def wait_for_lock_wait(engine) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with engine.connect() as connection:
+            waiting = connection.execute(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = :database "
+                    "AND wait_event_type = 'Lock' "
+                    "AND pid <> pg_backend_pid()"
+                ),
+                {"database": engine.url.database},
+            ).scalar_one()
+        if waiting:
+            return
+        time.sleep(0.01)
+    raise AssertionError("no PostgreSQL lock wait observed")
+
+
+def run_reopen_process(url: str, action: str, capability: str, version: int):
+    context = multiprocessing.get_context("fork")
+    output = context.Queue()
+    process = context.Process(
+        target=reopen_in_process,
+        args=(url, action, capability, version, output),
+    )
+    process.start()
+    result = output.get(timeout=10)
+    process.join(timeout=10)
+    assert process.exitcode == 0
+    return result
 
 
 def test_simultaneous_independent_process_claims_have_one_winner(
@@ -70,6 +135,44 @@ def test_simultaneous_independent_process_claims_have_one_winner(
     assert snapshot is not None
     assert snapshot.state == "active"
     assert snapshot.ownership_version == 1
+
+
+def test_independent_process_reopen_recovers_expiry_and_lifecycle_event(
+    postgres_engine, store
+):
+    del store  # The fixture truncates the explicitly supplied disposable database.
+    url = os.environ["LEO173_TEST_DATABASE_URL"]
+    reopened = PostgresReservationStore(postgres_engine)
+    first = claim(
+        reopened,
+        resident="resident-reopen",
+        owner="visitor-reopen",
+        key="claim-reopen",
+    )
+
+    before = run_reopen_process(url, "snapshot", first.capability, first.ownership_version)
+    assert before == {"state": "active", "version": 1, "events": 0}
+
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE conversation_reservations "
+                "SET last_accepted_visitor_message_at = "
+                "clock_timestamp() - interval '301 seconds' "
+                "WHERE resident_id = 'resident-reopen'"
+            )
+        )
+
+    after_expiry = run_reopen_process(
+        url, "expire", first.capability, first.ownership_version
+    )
+    assert after_expiry == {"outcome": Outcome.EXPIRED.value, "version": 2, "events": 1}
+    after = run_reopen_process(url, "snapshot", first.capability, first.ownership_version)
+    assert after == {"state": "released", "version": 2, "events": 1}
+
+    second = claim(reopened, "resident-reopen", "visitor-reopen-2", "claim-reopen-2")
+    assert second.ownership_version == 3
+    assert len(reopened.events("resident-reopen")) == 1
 
 
 def test_restart_reopen_preserves_timestamp_and_fence_at_boundary(store, reservation_clock):
@@ -105,38 +208,53 @@ def test_duplicate_rejected_heartbeat_reattach_and_model_do_not_renew(
 ):
     first = claim(store)
     original_timestamp = store.snapshot("resident-1").last_accepted_visitor_message_at
+    original_expiry = original_timestamp + IDLE_TIMEOUT
     reservation_clock.advance(timedelta(seconds=10))
 
-    duplicate = store.renew(
+    accepted = store.renew(
         "resident-1", "visitor-1", first.capability, first.ownership_version, "renew-1"
     )
-    assert duplicate.outcome is Outcome.ACCEPTED
+    assert accepted.outcome is Outcome.ACCEPTED
     renewed_at = store.snapshot("resident-1").last_accepted_visitor_message_at
     assert renewed_at != original_timestamp
+    assert renewed_at + IDLE_TIMEOUT != original_expiry
+    accepted_expiry = renewed_at + IDLE_TIMEOUT
 
+    def assert_deadline_unchanged() -> None:
+        snapshot = store.snapshot("resident-1")
+        assert snapshot.last_accepted_visitor_message_at == renewed_at
+        assert snapshot.last_accepted_visitor_message_at + IDLE_TIMEOUT == accepted_expiry
+
+    reservation_clock.advance(timedelta(seconds=10))
     duplicate_retry = store.renew(
         "resident-1", "visitor-1", first.capability, first.ownership_version, "renew-1"
     )
     assert duplicate_retry.outcome is Outcome.ACCEPTED
     assert duplicate_retry.replayed
-    assert store.snapshot("resident-1").last_accepted_visitor_message_at == renewed_at
+    assert_deadline_unchanged()
 
+    reservation_clock.advance(timedelta(seconds=10))
     wrong = store.renew(
         "resident-1", "visitor-1", "forged-capability", first.ownership_version, "renew-wrong"
     )
     assert wrong.outcome is Outcome.INVALID_CAPABILITY
-    assert store.snapshot("resident-1").last_accepted_visitor_message_at == renewed_at
+    assert_deadline_unchanged()
 
+    reservation_clock.advance(timedelta(seconds=10))
     heartbeat = store.heartbeat(
         "resident-1", "visitor-1", first.capability, first.ownership_version, "heartbeat-1"
     )
+    assert heartbeat.outcome is Outcome.VALIDATED
+    assert_deadline_unchanged()
+
+    reservation_clock.advance(timedelta(seconds=10))
     reattached = store.reattach(
         "resident-1", "visitor-1", first.capability, first.ownership_version, "reattach-1"
     )
-    assert heartbeat.outcome is Outcome.VALIDATED
     assert reattached.outcome is Outcome.ATTACHED
-    assert store.snapshot("resident-1").last_accepted_visitor_message_at == renewed_at
+    assert_deadline_unchanged()
 
+    reservation_clock.advance(timedelta(seconds=10))
     applied = store.apply_result(
         "resident-1",
         "visitor-1",
@@ -158,8 +276,136 @@ def test_duplicate_rejected_heartbeat_reattach_and_model_do_not_renew(
         ),
     )
     assert applied.outcome is Outcome.APPLIED
-    assert store.snapshot("resident-1").last_accepted_visitor_message_at == renewed_at
+    assert_deadline_unchanged()
     assert target_count(postgres_engine) == 1
+
+    reservation_clock.set(accepted_expiry)
+    expired = store.heartbeat(
+        "resident-1", "visitor-1", first.capability, first.ownership_version, "heartbeat-boundary"
+    )
+    assert expired.outcome is Outcome.EXPIRED
+    assert len(store.events("resident-1")) == 1
+
+
+def test_result_callback_crossing_exact_injected_deadline_rolls_back_target(
+    store, reservation_clock, postgres_engine
+):
+    first = claim(store)
+    reservation_clock.advance(timedelta(seconds=299.999))
+    callback_started = Event()
+    allow_callback_return = Event()
+
+    def blocked_mutation(session, snapshot):
+        callback_started.set()
+        assert allow_callback_return.wait(timeout=5)
+        session.execute(
+            text(
+                "INSERT INTO conversation_test_result_targets "
+                "(result_id, resident_id, ownership_version, applied_at) "
+                "VALUES ('crossed-injected-deadline', :resident_id, :version, now())"
+            ),
+            {"resident_id": snapshot.resident_id, "version": snapshot.ownership_version},
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            store.apply_result,
+            "resident-1",
+            "visitor-1",
+            first.capability,
+            first.ownership_version,
+            "crossed-injected-deadline",
+            blocked_mutation,
+        )
+        assert callback_started.wait(timeout=5)
+        reservation_clock.advance(timedelta(milliseconds=1))
+        allow_callback_return.set()
+        result = future.result(timeout=5)
+
+    assert result.outcome is Outcome.EXPIRED
+    assert target_count(postgres_engine) == 0
+    assert store.snapshot("resident-1").state == "released"
+    assert len(store.events("resident-1")) == 1
+
+
+def test_result_callback_crossing_real_database_deadline_rolls_back_target(
+    postgres_engine, store
+):
+    del store  # The fixture truncates the explicitly supplied disposable database.
+    database_store = PostgresReservationStore(postgres_engine)
+    first = claim(
+        database_store,
+        resident="resident-real-clock",
+        owner="visitor-real-clock",
+        key="claim-real-clock",
+    )
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE conversation_reservations "
+                "SET last_accepted_visitor_message_at = "
+                "clock_timestamp() - interval '299 seconds' "
+                "WHERE resident_id = 'resident-real-clock'"
+            )
+        )
+
+    def slow_mutation(session, snapshot):
+        session.execute(text("SELECT pg_sleep(1.2)"))
+        session.execute(
+            text(
+                "INSERT INTO conversation_test_result_targets "
+                "(result_id, resident_id, ownership_version, applied_at) "
+                "VALUES ('crossed-real-deadline', :resident_id, :version, clock_timestamp())"
+            ),
+            {"resident_id": snapshot.resident_id, "version": snapshot.ownership_version},
+        )
+
+    result = database_store.apply_result(
+        "resident-real-clock",
+        "visitor-real-clock",
+        first.capability,
+        first.ownership_version,
+        "crossed-real-deadline",
+        slow_mutation,
+    )
+    assert result.outcome is Outcome.EXPIRED
+    assert target_count(postgres_engine) == 0
+    assert database_store.snapshot("resident-real-clock").state == "released"
+    assert len(database_store.events("resident-real-clock")) == 1
+
+
+def test_clock_is_sampled_after_a_resident_lock_wait(
+    store, reservation_clock, postgres_engine
+):
+    first = claim(store, resident="resident-lock-wait")
+    reservation_clock.advance(timedelta(seconds=299.999))
+
+    with postgres_engine.connect() as blocker:
+        transaction = blocker.begin()
+        blocker.execute(
+            text(
+                "SELECT resident_id FROM conversation_reservations "
+                "WHERE resident_id = 'resident-lock-wait' FOR UPDATE"
+            )
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                store.apply_result,
+                "resident-lock-wait",
+                "visitor-1",
+                first.capability,
+                first.ownership_version,
+                "lock-wait-result",
+                lambda session, snapshot: None,
+            )
+            wait_for_lock_wait(postgres_engine)
+            reservation_clock.advance(timedelta(milliseconds=1))
+            transaction.commit()
+            result = future.result(timeout=5)
+
+    assert result.outcome is Outcome.EXPIRED
+    assert target_count(postgres_engine) == 0
+    assert len(store.events("resident-lock-wait")) == 1
 
 
 def test_goodbye_is_idempotent_and_fence_survives_reclaim(store):
@@ -305,7 +551,7 @@ def test_result_guard_serializes_with_goodbye_and_rollback_is_atomic(
             first.ownership_version,
             "goodbye-after-result",
         )
-        time.sleep(0.1)
+        wait_for_lock_wait(postgres_engine)
         assert not goodbye_future.done(), "goodbye must wait for the guarded result transaction"
         allow_callback_commit.set()
         result = result_future.result(timeout=5)
