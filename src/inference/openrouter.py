@@ -12,7 +12,7 @@ files, history, or module/object state.
 
 The accounting protocol is deliberately a seam for the durable shared owner
 (LEO-169).  reserve must atomically validate a request-bound, one-use,
-unexpired authorized attempt and return an opaque reservation.  settle must
+unexpired authorized attempt and return a typed PermitReservation.  settle must
 record completed, provider_failed, unknown_sent, or cancelled.  A missing,
 denied, expired, exhausted, reused, or failing admission fails closed before
 HTTP.  A timeout or ambiguous transport result is unknown_sent and is never
@@ -23,11 +23,17 @@ The request is capped at 65,536 UTF-8 bytes, each context and visitor value
 has a finite input cap, responses (including error bodies) are read once with
 a 262,144-byte limit plus one sentinel byte, parsed reply JSON is capped at
 16,384 UTF-8 bytes, and the attempt deadline is 30 seconds.  The urllib
-transport uses a redirect-blocking opener and bounded socket waits.  Python's
+transport uses an explicit no-environment-proxy opener and a per-operation
+socket timeout set to the remaining attempt budget, up to 30 seconds.  Python's
 blocking DNS and socket operations cannot be forcibly interrupted by a
 monotonic check, so the deadline is checked between operations and is not
 advertised as a guaranteed hard wall-clock interrupt.  Injected credential,
 permit, and transport callbacks are likewise caller-owned blocking boundaries.
+
+Known optional provider metadata such as a null refusal, bounded reasoning,
+annotations, citations, and a nullable system fingerprint is shape-checked
+and discarded.  A non-null refusal, missing assistant content, unsupported
+tool call, or malformed required action proposal remains a safe failure.
 
 Response model/provider names and numeric usage are bounded, allowlisted
 telemetry only.  Usage anomalies are reported as flags and never authorize,
@@ -52,7 +58,7 @@ import socket
 import time
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 import uuid
 
 
@@ -70,9 +76,11 @@ MAX_TELEMETRY_STRING_BYTES = 512
 MAX_ACTION_BYTES = 256
 MAX_TARGET_BYTES = 256
 MAX_ATTEMPT_SECONDS = 30.0
-MAX_SOCKET_WAIT_SECONDS = 5.0
+MAX_SOCKET_WAIT_SECONDS = MAX_ATTEMPT_SECONDS
 MAX_JSON_DEPTH = 24
 MAX_JSON_NODES = 4_096
+MAX_OPTIONAL_METADATA_ITEMS = 64
+MAX_REASONING_BYTES = 16_384
 MAX_TELEMETRY_COUNT = 1_000_000_000
 MAX_TELEMETRY_COST = 1_000_000_000.0
 
@@ -119,6 +127,30 @@ class RedirectRefused(Exception):
 
 
 @dataclass(frozen=True)
+class PermitReservation:
+    """Typed opaque result of one durable, request-bound admission reserve."""
+
+    reservation_id: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.reservation_id, str)
+            or not self.reservation_id
+            or len(self.reservation_id.encode("utf-8")) > MAX_CREDENTIAL_BYTES
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in self.reservation_id
+            )
+        ):
+            raise ValueError()
+
+    def __repr__(self) -> str:
+        """Do not expose an accounting token in ordinary diagnostics."""
+
+        return "PermitReservation(<redacted>)"
+
+
+@dataclass(frozen=True)
 class AdmissionRequest:
     """Safe request metadata passed to the durable accounting owner.
 
@@ -154,12 +186,12 @@ class AccountingPermit(Protocol):
     authorization.  The adapter never implements the shared ledger.
     """
 
-    def reserve(self, request: AdmissionRequest) -> object:
+    def reserve(self, request: AdmissionRequest) -> PermitReservation:
         """Atomically reserve one request-bound attempt or reject it."""
 
     def settle(
         self,
-        reservation: object,
+        reservation: PermitReservation,
         *,
         outcome: AttemptOutcome,
         sent_state: SentState,
@@ -212,6 +244,7 @@ class Failure:
     latency_ms: int
     sent_state: str
     accounting_state: str
+    original_category: str | None = None
 
 
 @dataclass(frozen=True)
@@ -445,6 +478,18 @@ def _bounded_telemetry_string(value: object, category: str) -> str:
     return value
 
 
+def _optional_bounded_string(value: object, limit: int, category: str) -> None:
+    if value is not None:
+        _string_size(value, limit, category)
+
+
+def _optional_metadata_list(value: object, category: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list) or len(value) > MAX_OPTIONAL_METADATA_ITEMS:
+        raise _Reject(category)
+
+
 def _usage_number(raw: Mapping[str, object], key: str) -> tuple[int | None, bool]:
     if key not in raw:
         return None, False
@@ -565,12 +610,21 @@ def _parse_success(value: object) -> _ParsedReply:
         "object",
         "created",
         "system_fingerprint",
+        "citations",
     }
     if set(value) - allowed_outer:
         raise _Reject("malformed_response")
-    for key in ("id", "object", "system_fingerprint"):
+    for key in ("id", "object"):
         if key in value:
             _bounded_telemetry_string(value[key], "malformed_response")
+    if "system_fingerprint" in value:
+        _optional_bounded_string(
+            value["system_fingerprint"],
+            MAX_TELEMETRY_STRING_BYTES,
+            "malformed_response",
+        )
+    if "citations" in value:
+        _optional_metadata_list(value["citations"], "malformed_response")
     if "created" in value:
         created = value["created"]
         if (
@@ -594,7 +648,11 @@ def _parse_success(value: object) -> _ParsedReply:
         if isinstance(index, bool) or not isinstance(index, int) or index < 0 or index > 256:
             raise _Reject("malformed_choice")
     if "native_finish_reason" in choice:
-        _bounded_telemetry_string(choice["native_finish_reason"], "malformed_choice")
+        _optional_bounded_string(
+            choice["native_finish_reason"],
+            MAX_TELEMETRY_STRING_BYTES,
+            "malformed_choice",
+        )
     if "logprobs" in choice and choice["logprobs"] is not None and not isinstance(
         choice["logprobs"], dict
     ):
@@ -610,10 +668,33 @@ def _parse_success(value: object) -> _ParsedReply:
         raise _Reject("malformed_message")
     if "tool_calls" in message or "function_call" in message:
         raise _Reject("tool_calls_not_allowed")
-    if "refusal" in message:
-        raise _Reject("refusal_not_allowed")
-    if set(message) != {"role", "content"} or message.get("role") != "assistant":
+    allowed_message = {
+        "role",
+        "content",
+        "refusal",
+        "reasoning",
+        "reasoning_details",
+        "annotations",
+    }
+    if set(message) - allowed_message or message.get("role") != "assistant":
         raise _Reject("malformed_message")
+    refusal = message.get("refusal")
+    refusal_present = refusal is not None
+    if refusal_present:
+        _string_size(refusal, MAX_REASONING_BYTES, "malformed_refusal")
+        raise _Reject("refusal_not_allowed")
+    if "reasoning" in message:
+        _optional_bounded_string(
+            message["reasoning"],
+            MAX_REASONING_BYTES,
+            "malformed_reasoning",
+        )
+    if "reasoning_details" in message:
+        _optional_metadata_list(message["reasoning_details"], "malformed_reasoning")
+    if "annotations" in message:
+        _optional_metadata_list(message["annotations"], "malformed_annotations")
+    if "content" not in message or message["content"] is None:
+        raise _Reject("refusal_not_allowed" if refusal_present else "content_missing")
     content = message.get("content")
     _string_size(
         content,
@@ -656,6 +737,7 @@ def _parse_success(value: object) -> _ParsedReply:
 def _failure(
     category: str,
     *,
+    original_category: str | None = None,
     status: int | None,
     started: float | None,
     clock: MonotonicClock | None,
@@ -665,6 +747,7 @@ def _failure(
     latency = _latency_ms(clock, started)
     metadata = Failure(
         category=category,
+        original_category=original_category,
         http_status=_status(status),
         latency_ms=latency,
         sent_state=sent_state.value,
@@ -688,7 +771,7 @@ def _failure(
 
 def _settle(
     permit: AccountingPermit,
-    reservation: object,
+    reservation: PermitReservation,
     outcome: AttemptOutcome,
     sent_state: SentState,
 ) -> str:
@@ -712,15 +795,17 @@ def _reserved_failure(
     started: float | None,
     clock: MonotonicClock,
     permit: AccountingPermit,
-    reservation: object,
+    reservation: PermitReservation,
     outcome: AttemptOutcome,
     sent_state: SentState,
 ) -> CompletionResult:
     accounting_state = _settle(permit, reservation, outcome, sent_state)
+    original_category = category if accounting_state == "settlement_failed" else None
     if accounting_state == "settlement_failed":
         category = "accounting_failure"
     return _failure(
         category,
+        original_category=original_category,
         status=status,
         started=started,
         clock=clock,
@@ -762,7 +847,7 @@ class UrllibTransport:
             or timeout > MAX_SOCKET_WAIT_SECONDS
         ):
             raise ValueError()
-        opener = build_opener(_NoRedirectHandler())
+        opener = build_opener(ProxyHandler({}), _NoRedirectHandler())
         wire_request = Request(
             request.url,
             data=request.body,
@@ -969,9 +1054,9 @@ def complete(
             sent_state=SentState.NOT_SENT,
             accounting_state="admission_failed",
         )
-    if reservation is None or isinstance(reservation, bool):
+    if not isinstance(reservation, PermitReservation):
         return _failure(
-            "admission_denied",
+            "invalid_reservation",
             status=None,
             started=started,
             clock=clock,
@@ -1135,6 +1220,7 @@ def complete(
     if accounting_state == "settlement_failed":
         return _failure(
             "accounting_failure",
+            original_category="completed",
             status=status,
             started=started,
             clock=clock,
