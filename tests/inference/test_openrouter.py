@@ -681,6 +681,48 @@ class OpenRouterAdapterTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertEqual(result.failure.category, category)
 
+    def test_realistic_current_response_created_timestamp_is_accepted(self) -> None:
+        body = response_body(
+            usage={"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20, "cost": 0},
+            message_extra={
+                "refusal": None,
+                "reasoning": "fake-reasoning-metadata",
+                "reasoning_details": [{"type": "reasoning.text"}],
+                "annotations": [{"type": "url_citation"}],
+            },
+            outer_extra={
+                "id": "chatcmpl-fixture",
+                "object": "chat.completion",
+                "created": 1_780_000_000,
+                "system_fingerprint": None,
+                "citations": ["https://fixture.invalid/source"],
+            },
+        )
+        transport = FakeTransport(FakeResponse(200, body))
+        result = invoke(transport=transport)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.reported_model, "fixture/free-model-a")
+        self.assertEqual(result.usage.total_tokens, 20)
+        self.assertEqual(transport.calls, 1)
+
+    def test_created_timestamp_keeps_strict_type_and_sane_bounds(self) -> None:
+        fixtures = (
+            (True, "malformed_response"),
+            (1_780_000_000.0, "malformed_response"),
+            (-1, "malformed_response"),
+            (openrouter.MAX_CREATED_TIMESTAMP + 1, "malformed_response"),
+            (float("nan"), "nonfinite_json_number"),
+        )
+        for created, category in fixtures:
+            with self.subTest(created=created):
+                result = invoke(
+                    transport=FakeTransport(
+                        FakeResponse(200, response_body(outer_extra={"created": created}))
+                    )
+                )
+                self.assertFalse(result.ok)
+                self.assertEqual(result.failure.category, category)
+
     def test_provider_error_is_structured_without_provider_text(self) -> None:
         body = b'{"error":{"code":401,"message":"fake-provider-secret-and-prompt"}}'
         result = invoke(transport=FakeTransport(FakeResponse(200, body)))

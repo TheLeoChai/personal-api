@@ -34,6 +34,8 @@ Known optional provider metadata such as a null refusal, bounded reasoning,
 annotations, citations, and a nullable system fingerprint is shape-checked
 and discarded.  A non-null refusal, missing assistant content, unsupported
 tool call, or malformed required action proposal remains a safe failure.
+When present, the outer created field is an integer Unix timestamp bounded
+from epoch through 2100-01-01 UTC; usage numeric bounds are separate.
 
 Response model/provider names and numeric usage are bounded, allowlisted
 telemetry only.  Usage anomalies are reported as flags and never authorize,
@@ -81,6 +83,8 @@ MAX_JSON_DEPTH = 24
 MAX_JSON_NODES = 4_096
 MAX_OPTIONAL_METADATA_ITEMS = 64
 MAX_REASONING_BYTES = 16_384
+# Unix timestamp bound through 2100-01-01 UTC; independent of usage counts.
+MAX_CREATED_TIMESTAMP = 4_102_444_800
 MAX_TELEMETRY_COUNT = 1_000_000_000
 MAX_TELEMETRY_COST = 1_000_000_000.0
 
@@ -631,7 +635,7 @@ def _parse_success(value: object) -> _ParsedReply:
             isinstance(created, bool)
             or not isinstance(created, int)
             or created < 0
-            or created > MAX_TELEMETRY_COUNT
+            or created > MAX_CREATED_TIMESTAMP
         ):
             raise _Reject("malformed_response")
     choices = value.get("choices")
