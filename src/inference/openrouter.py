@@ -26,7 +26,8 @@ a 262,144-byte limit plus one sentinel byte, parsed reply JSON is capped at
 transport uses a redirect-blocking opener and bounded socket waits.  Python's
 blocking DNS and socket operations cannot be forcibly interrupted by a
 monotonic check, so the deadline is checked between operations and is not
-advertised as a guaranteed hard wall-clock interrupt.
+advertised as a guaranteed hard wall-clock interrupt.  Injected credential,
+permit, and transport callbacks are likewise caller-owned blocking boundaries.
 
 Response model/provider names and numeric usage are bounded, allowlisted
 telemetry only.  Usage anomalies are reported as flags and never authorize,
@@ -753,6 +754,14 @@ class UrllibTransport:
     def send(self, request: HttpRequest, *, timeout: float) -> HttpResponse:
         if request.method != "POST" or request.url != OPENROUTER_URL:
             raise ValueError()
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+            or timeout > MAX_SOCKET_WAIT_SECONDS
+        ):
+            raise ValueError()
         opener = build_opener(_NoRedirectHandler())
         wire_request = Request(
             request.url,
@@ -844,7 +853,19 @@ def complete(
             sent_state=SentState.NOT_SENT,
             accounting_state="not_reserved",
         )
-    if not callable(getattr(permit, "reserve", None)) or not callable(getattr(permit, "settle", None)):
+    try:
+        reserve_method = getattr(permit, "reserve", None)
+        settle_method = getattr(permit, "settle", None)
+    except Exception:
+        return _failure(
+            "invalid_permit",
+            status=None,
+            started=started,
+            clock=clock,
+            sent_state=SentState.NOT_SENT,
+            accounting_state="not_reserved",
+        )
+    if not callable(reserve_method) or not callable(settle_method):
         return _failure(
             "invalid_permit",
             status=None,
@@ -948,7 +969,7 @@ def complete(
             sent_state=SentState.NOT_SENT,
             accounting_state="admission_failed",
         )
-    if reservation is None or reservation is False:
+    if reservation is None or isinstance(reservation, bool):
         return _failure(
             "admission_denied",
             status=None,

@@ -315,6 +315,14 @@ class OpenRouterAdapterTests(unittest.TestCase):
                 self.assertEqual(transport.calls, 0)
                 self.assertEqual(permit.settle_calls, [])
 
+    def test_boolean_permit_result_is_not_default_allow(self) -> None:
+        permit = FakePermit(reservation=True)
+        transport = FakeTransport(FakeResponse(200, response_body()))
+        result = invoke(permit=permit, transport=transport)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failure.category, "admission_denied")
+        self.assertEqual(transport.calls, 0)
+
     def test_accounting_failure_before_send_is_fail_closed(self) -> None:
         permit = FakePermit(reserve_error=RuntimeError("fake-accounting-secret"))
         transport = FakeTransport(FakeResponse(200, response_body()))
