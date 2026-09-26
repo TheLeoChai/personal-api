@@ -4,16 +4,31 @@
 -- No HTTP endpoint.  World time and downtime catch-up are undecided and
 -- deliberately absent.  Mirrors the ORM in src/world/postgres.py.
 
+-- world_states keeps the canonical current head snapshot (head_state) next
+-- to the version-zero initial snapshot.  Both carry the state schema tag;
+-- the application re-derives head_state by replay on every load and submit.
 CREATE TABLE public.world_states (
     world_id text NOT NULL,
+    state_schema text NOT NULL,
     initial_state jsonb NOT NULL,
     initial_sha256 character(64) NOT NULL,
+    head_state jsonb NOT NULL,
     head_version bigint NOT NULL,
     head_sha256 character(64) NOT NULL,
     created_at timestamp with time zone NOT NULL DEFAULT now(),
     CONSTRAINT world_states_pkey PRIMARY KEY (world_id),
     CONSTRAINT world_state_id_ck CHECK (char_length(world_id) BETWEEN 1 AND 128),
-    CONSTRAINT world_state_initial_ck CHECK (jsonb_typeof(initial_state) = 'object'),
+    CONSTRAINT world_state_schema_ck CHECK (state_schema = 'offline-world/v2'),
+    CONSTRAINT world_state_initial_ck CHECK (
+        jsonb_typeof(initial_state) = 'object'
+        AND initial_state -> 'schema' = to_jsonb(state_schema)
+        AND initial_state -> 'version' = '0'::jsonb
+    ),
+    CONSTRAINT world_state_head_ck CHECK (
+        jsonb_typeof(head_state) = 'object'
+        AND head_state -> 'schema' = to_jsonb(state_schema)
+        AND head_state -> 'version' = to_jsonb(head_version)
+    ),
     CONSTRAINT world_state_head_version_ck CHECK (head_version BETWEEN 0 AND 4096),
     CONSTRAINT world_state_sha256_ck CHECK (
         initial_sha256 ~ '^[0-9a-f]{64}$' AND head_sha256 ~ '^[0-9a-f]{64}$'

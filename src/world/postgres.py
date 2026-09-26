@@ -2,26 +2,33 @@
 
 Contract
 --------
-``world_states`` holds each world's version-zero initial state (strict JSON,
-decoded by ``state_from_mapping``) and its durable head: version and state
-digest.  ``world_events`` holds the ordered accepted events.
+``world_states`` holds each world's state schema tag, its version-zero
+initial snapshot, and its canonical current head: the full head snapshot,
+version, and digest.  Snapshots are strict JSON decoded by
+``state_from_mapping``.  ``world_events`` holds the ordered accepted events.
 ``world_operations`` holds one idempotent outcome per submit key.
+
+Every ``load`` and ``submit`` first runs ``verify_world``.  It decodes both
+snapshots, checks their digests, replays the events (checking every digest
+and the order), and requires the replayed state to equal the stored head
+snapshot, version, and digest.  A consistent-looking but altered head or log
+is therefore refused, not built on or reported.  Each call replays at most
+``MAX_WORLD_VERSION`` small events.  Correctness is preferred over caching,
+so a world's full history costs O(n²) digests in total, bounded by that cap.
 
 * ``create`` inserts the world with ``ON CONFLICT DO NOTHING``.  Repeating it
   with the same initial state is a no-op; a different initial state raises
   ``WorldConflict``.  Concurrent first creates resolve on the primary key.
-* ``submit`` runs in one transaction.  It locks the world row, checks the
-  idempotency key's fingerprint, rebuilds the head by verified replay, and
-  asks the existing ``apply_proposal`` engine for the decision.  An accepted
-  proposal writes the event, the new head, and the operation together.  A
-  rejection writes only the operation and changes no state, version, or
-  event.  The replay is bounded by ``MAX_WORLD_VERSION`` small events and
-  means a submit never builds on a head its log cannot reproduce.
-  Retrying a key with the same proposal returns the recorded outcome.
-  Reusing a key with a different proposal raises ``WorldConflict``.
-* ``load`` replays the stored events from the initial state, verifying every
-  digest and the event order, and checks that the result equals the
-  persisted head.
+* ``submit`` runs in one transaction.  It locks the world row, verifies the
+  world, then checks the idempotency key.  A retry with the same proposal
+  returns the recorded outcome only after ``recorded_result`` confirms it
+  against the verified log.  Reusing a key with a different proposal raises
+  ``WorldConflict``.  Otherwise the existing ``apply_proposal`` engine
+  decides.  An accepted proposal writes the event, the new head snapshot,
+  version, and digest, and the operation together.  A rejection writes only
+  the operation and changes no state, version, or event.
+* ``load`` holds a share lock on the world row and returns the verified
+  world.
 
 Trusted boundary: ``submit`` accepts only an in-process ``ActionProposal``
 built by ``run_offline_turn`` from a settled adapter result.  It never parses
@@ -45,7 +52,7 @@ from datetime import datetime
 import hashlib
 import json
 import re
-from typing import Any
+from typing import Any, Iterable
 
 from sqlalchemy import (
     CHAR,
@@ -67,6 +74,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from .offline_loop import (
     MAX_IDENTIFIER_LENGTH,
     MAX_WORLD_VERSION,
+    SCHEMA,
     ActionProposal,
     InferenceMode,
     Provenance,
@@ -105,8 +113,18 @@ class WorldRecord(Base):
             f"char_length(world_id) BETWEEN 1 AND {MAX_IDENTIFIER_LENGTH}",
             name="world_state_id_ck",
         ),
+        CheckConstraint(f"state_schema = '{SCHEMA}'", name="world_state_schema_ck"),
         CheckConstraint(
-            "jsonb_typeof(initial_state) = 'object'", name="world_state_initial_ck"
+            "jsonb_typeof(initial_state) = 'object'"
+            " AND initial_state -> 'schema' = to_jsonb(state_schema)"
+            " AND initial_state -> 'version' = '0'::jsonb",
+            name="world_state_initial_ck",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(head_state) = 'object'"
+            " AND head_state -> 'schema' = to_jsonb(state_schema)"
+            " AND head_state -> 'version' = to_jsonb(head_version)",
+            name="world_state_head_ck",
         ),
         CheckConstraint(
             f"head_version BETWEEN 0 AND {MAX_WORLD_VERSION}",
@@ -119,8 +137,10 @@ class WorldRecord(Base):
     )
 
     world_id: Mapped[str] = mapped_column(Text)
+    state_schema: Mapped[str] = mapped_column(Text, nullable=False)
     initial_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     initial_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    head_state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     head_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
     head_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -284,6 +304,21 @@ def proposal_fingerprint(world_id: str, proposal: ActionProposal) -> str:
     return hashlib.sha256(text.encode("ascii")).hexdigest()
 
 
+def event_to_record(world_id: str, event: WorldEvent) -> WorldEventRecord:
+    return WorldEventRecord(
+        world_id=world_id,
+        version=event.version,
+        prior_version=event.prior_version,
+        event_id=event.event_id,
+        actor_id=event.actor_id,
+        action=event.action,
+        target=event.target,
+        inference_mode=event.inference_mode.value,
+        context_sha256=event.context_sha256,
+        state_sha256=event.state_sha256,
+    )
+
+
 def event_from_record(record: WorldEventRecord) -> WorldEvent:
     """Decode one stored event row; ``replay`` then checks order and digest."""
 
@@ -309,6 +344,88 @@ def event_from_record(record: WorldEventRecord) -> WorldEvent:
     )
 
 
+def _stored_state(value: object, field_name: str) -> WorldState:
+    try:
+        return state_from_mapping(value)
+    except WorldError as exc:
+        raise ReplayError(f"stored {field_name} is malformed") from exc
+
+
+def verify_world(
+    record: WorldRecord, event_records: Iterable[WorldEventRecord]
+) -> tuple[WorldState, WorldState, tuple[WorldEvent, ...]]:
+    """Check one stored world end to end; return (initial, head, events).
+
+    Both snapshots are decoded strictly and digest-checked.  The events,
+    given in version order, are replayed from the initial snapshot, and the
+    result must equal the stored head snapshot, version, and digest.
+    """
+
+    if record.state_schema != SCHEMA:
+        raise ReplayError("stored state schema is not supported")
+    initial = _stored_state(record.initial_state, "initial state")
+    if initial.version != 0 or initial.digest != record.initial_sha256:
+        raise ReplayError("stored initial state does not match its digest")
+    head = _stored_state(record.head_state, "head state")
+    if head.version != record.head_version or head.digest != record.head_sha256:
+        raise ReplayError("stored head state does not match its version and digest")
+    events = tuple(event_from_record(row) for row in event_records)
+    if replay(initial, events) != head:
+        raise ReplayError("stored head state does not match its event log")
+    return initial, head, events
+
+
+def recorded_result(
+    operation: WorldOperationRecord,
+    initial: WorldState,
+    events: tuple[WorldEvent, ...],
+) -> SubmitResult:
+    """Rebuild a recorded outcome, confirming it against a verified log.
+
+    ``initial`` and ``events`` must come from ``verify_world``.  An accepted
+    operation must name a logged event with its version and digest.  A
+    rejected one must name a version and digest the log actually passed
+    through.
+    """
+
+    version = operation.version
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ReplayError("recorded operation version is malformed")
+    event = None
+    reason = None
+    if operation.outcome == "accepted":
+        if (
+            operation.reason is not None
+            or operation.event_version != version
+            or not 1 <= version <= len(events)
+        ):
+            raise ReplayError("recorded acceptance does not match the event log")
+        event = events[version - 1]
+        if operation.state_sha256 != event.state_sha256:
+            raise ReplayError("recorded acceptance does not match the event log")
+    elif operation.outcome == "rejected":
+        try:
+            reason = RejectionReason(operation.reason)
+        except ValueError as exc:
+            raise ReplayError("recorded rejection has an unknown reason") from exc
+        if operation.event_version is not None or not 0 <= version <= len(events):
+            raise ReplayError("recorded rejection does not match the event log")
+        expected = initial.digest if version == 0 else events[version - 1].state_sha256
+        if operation.state_sha256 != expected:
+            raise ReplayError("recorded rejection does not match the event log")
+    else:
+        raise ReplayError("recorded operation has an unknown outcome")
+    return SubmitResult(
+        world_id=operation.world_id,
+        accepted=event is not None,
+        reason=reason,
+        version=version,
+        state_sha256=operation.state_sha256,
+        event=event,
+        replayed=True,
+    )
+
+
 class PostgresWorldStore:
     """Durable single-resident world store over an injected engine."""
 
@@ -324,13 +441,16 @@ class PostgresWorldStore:
         if "\x00" in initial.resident.resident_id:
             raise WorldError("resident_id cannot be stored")
         digest = initial.digest
+        snapshot = initial.as_mapping()
         with self._sessions() as session, session.begin():
             inserted = session.execute(
                 pg_insert(WorldRecord)
                 .values(
                     world_id=world_id,
-                    initial_state=initial.as_mapping(),
+                    state_schema=SCHEMA,
+                    initial_state=snapshot,
                     initial_sha256=digest,
+                    head_state=snapshot,
                     head_version=0,
                     head_sha256=digest,
                 )
@@ -357,6 +477,9 @@ class PostgresWorldStore:
         fingerprint = proposal_fingerprint(world_id, proposal)
         with self._sessions() as session, session.begin():
             record = self._world(session, world_id, lock="update")
+            # Verify before answering anything, including retries, so a
+            # damaged head or log is never built on or reported as accepted.
+            initial, state, events = self._verified(session, record)
             previous = session.execute(
                 select(WorldOperationRecord).where(
                     WorldOperationRecord.world_id == world_id,
@@ -366,29 +489,16 @@ class PostgresWorldStore:
             if previous is not None:
                 if previous.request_fingerprint != fingerprint:
                     raise WorldConflict("idempotency key was reused with a different proposal")
-                return self._recorded_result(session, previous)
+                return recorded_result(previous, initial, events)
 
-            _, state, _ = self._verified(session, record)
             decision = apply_proposal(state, proposal)
             event = decision.event
             if decision.accepted:
                 if event is None:
                     raise RuntimeError("accepted decision carried no event")
-                session.add(
-                    WorldEventRecord(
-                        world_id=world_id,
-                        version=event.version,
-                        prior_version=event.prior_version,
-                        event_id=event.event_id,
-                        actor_id=event.actor_id,
-                        action=event.action,
-                        target=event.target,
-                        inference_mode=event.inference_mode.value,
-                        context_sha256=event.context_sha256,
-                        state_sha256=event.state_sha256,
-                    )
-                )
+                session.add(event_to_record(world_id, event))
                 session.flush()
+                record.head_state = decision.state.as_mapping()
                 record.head_version = decision.state.version
                 record.head_sha256 = decision.state.digest
             self._insert_operation(
@@ -444,43 +554,9 @@ class PostgresWorldStore:
     def _verified(
         session: Session, record: WorldRecord
     ) -> tuple[WorldState, WorldState, tuple[WorldEvent, ...]]:
-        try:
-            initial = state_from_mapping(record.initial_state)
-        except WorldError as exc:
-            raise ReplayError("stored initial state is malformed") from exc
-        if initial.version != 0 or initial.digest != record.initial_sha256:
-            raise ReplayError("stored initial state does not match its digest")
         rows = session.execute(
             select(WorldEventRecord)
             .where(WorldEventRecord.world_id == record.world_id)
             .order_by(WorldEventRecord.version)
         ).scalars()
-        events = tuple(event_from_record(row) for row in rows)
-        state = replay(initial, events)
-        if state.version != record.head_version or state.digest != record.head_sha256:
-            raise ReplayError("persisted head does not match its event log")
-        return initial, state, events
-
-    @staticmethod
-    def _recorded_result(session: Session, operation: WorldOperationRecord) -> SubmitResult:
-        event = None
-        reason = None
-        if operation.outcome == "accepted":
-            row = session.get(WorldEventRecord, (operation.world_id, operation.event_version))
-            if row is None:
-                raise ReplayError("recorded operation lost its event")
-            event = event_from_record(row)
-        else:
-            try:
-                reason = RejectionReason(operation.reason)
-            except ValueError as exc:
-                raise ReplayError("recorded operation has an unknown reason") from exc
-        return SubmitResult(
-            world_id=operation.world_id,
-            accepted=operation.outcome == "accepted",
-            reason=reason,
-            version=operation.version,
-            state_sha256=operation.state_sha256,
-            event=event,
-            replayed=True,
-        )
+        return verify_world(record, rows)

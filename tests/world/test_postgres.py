@@ -1,8 +1,11 @@
 """Tests for durable one-resident world persistence (LEO-186).
 
 The pure tests always run.  The PostgreSQL tests run only against an
-explicitly supplied disposable local database in LEO186_TEST_DATABASE_URL;
-they skip otherwise.  No SQLite or other stand-in is used for them.
+explicitly supplied disposable database in LEO186_TEST_DATABASE_URL and skip
+otherwise.  ``disposable_url`` refuses, before any connection, migration, or
+DROP, anything but a loopback ``postgresql+psycopg`` URL on an explicit
+non-5432 port, with no query overrides and a ``leo186_test_<suffix>``
+database.  No SQLite or other stand-in is used.
 
 Every proposal is built by ``run_offline_turn`` from a FAKE fixture reply over
 an in-memory transport with a synthetic permit.  There are no sockets,
@@ -16,13 +19,14 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import unittest
 from unittest import mock
 
-from sqlalchemy import create_engine, func, select, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import CheckConstraint, create_engine, func, select, text
+from sqlalchemy.engine import URL, make_url
 
 from inference.openrouter import PermitReservation
 from personas import (
@@ -44,23 +48,32 @@ from world import (
     ReplayError,
     WorldError,
     WorldState,
+    apply_proposal,
     initial_state,
     replay,
     run_offline_turn,
 )
+from world.offline_loop import SCHEMA
 from world.postgres import (
     Base,
     PostgresWorldStore,
     WorldConflict,
     WorldEventRecord,
     WorldNotFound,
+    WorldOperationRecord,
+    WorldRecord,
     event_from_record,
+    event_to_record,
     proposal_fingerprint,
+    recorded_result,
+    verify_world,
 )
 
 
 URL_ENV = "LEO186_TEST_DATABASE_URL"
 LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+DEFAULT_POSTGRES_PORT = 5432
+TEST_DATABASE_NAME = re.compile(r"leo186_test_[a-z0-9_]{1,40}")
 ROOT = Path(__file__).parents[2]
 MIGRATION = ROOT / "migrations" / "0003_world_state.sql"
 TABLES = ("world_states", "world_events", "world_operations")
@@ -165,6 +178,149 @@ def forged_proposal(state: WorldState, action: str, target: str | None) -> Actio
 def summary(result) -> tuple:
     reason = None if result.reason is None else result.reason.value
     return (result.accepted, reason, result.version, result.replayed)
+
+
+FULL_SEQUENCE = (("move", WELL), ("refill", WELL), ("move", HERB_BED), ("water", HERB_BED))
+
+
+def stored_world(steps=FULL_SEQUENCE):
+    """Rows exactly as ``submit`` would store them, built with no database."""
+
+    start = initial_state()
+    state = start
+    events = []
+    for action, target in steps:
+        decision = apply_proposal(state, adapter_proposal(state, action, target))
+        if not decision.accepted:
+            raise AssertionError((action, target, decision.reason))
+        events.append(decision.event)
+        state = decision.state
+    record = WorldRecord(
+        world_id="w",
+        state_schema=SCHEMA,
+        initial_state=json.loads(json.dumps(start.as_mapping())),
+        initial_sha256=start.digest,
+        head_state=json.loads(json.dumps(state.as_mapping())),
+        head_version=state.version,
+        head_sha256=state.digest,
+    )
+    rows = [event_to_record("w", event) for event in events]
+    return start, state, tuple(events), record, rows
+
+
+def operation(**fields) -> WorldOperationRecord:
+    base = dict(world_id="w", idempotency_key="k", request_fingerprint="f" * 64)
+    return WorldOperationRecord(**{**base, **fields})
+
+
+class VerificationTests(unittest.TestCase):
+    """No database: whole-world and retry integrity checks on stored rows."""
+
+    def setUp(self):
+        self.start, self.head, self.events, self.record, self.rows = stored_world()
+
+    def tampered(self, *, record=None, rows=None):
+        stored = WorldRecord(
+            **{
+                column: getattr(self.record, column)
+                for column in WorldRecord.__table__.columns.keys()
+                if column != "created_at"
+            }
+        )
+        for name, value in (record or {}).items():
+            setattr(stored, name, value)
+        return stored, self.rows if rows is None else rows
+
+    def test_full_sequence_verifies_to_watered_bed_and_nonempty_can(self):
+        initial, head, events = verify_world(self.record, self.rows)
+        self.assertEqual((initial, head, events), (self.start, self.head, self.events))
+        self.assertEqual(
+            (head.version, head.location, head.can_level, head.herb_bed_watered),
+            (4, HERB_BED, 2, True),
+        )
+
+    def test_tampered_world_is_refused(self):
+        other_head = dataclasses.replace(self.head, can_level=3)
+        other_start = initial_state(can_level=1)
+        bad_row = dataclasses.replace(self.events[1], target=HERB_BED)
+        wrong_digest = dataclasses.replace(self.events[2], state_sha256=self.events[1].state_sha256)
+        bool_as_int = json.loads(json.dumps(self.record.head_state))
+        bool_as_int["herb_bed"]["watered"] = 1
+        cases = {
+            "consistent other head snapshot": self.tampered(
+                record={"head_state": other_head.as_mapping(), "head_sha256": other_head.digest}
+            ),
+            "head digest only": self.tampered(record={"head_sha256": other_head.digest}),
+            "head version only": self.tampered(record={"head_version": 3}),
+            "head int for bool": self.tampered(record={"head_state": bool_as_int}),
+            "head missing": self.tampered(record={"head_state": None}),
+            "consistent other initial": self.tampered(
+                record={
+                    "initial_state": other_start.as_mapping(),
+                    "initial_sha256": other_start.digest,
+                }
+            ),
+            "schema tag": self.tampered(record={"state_schema": "offline-world/v1"}),
+            "event target": self.tampered(
+                rows=[self.rows[0], event_to_record("w", bad_row), *self.rows[2:]]
+            ),
+            "event digest from another event": self.tampered(
+                rows=[*self.rows[:2], event_to_record("w", wrong_digest), self.rows[3]]
+            ),
+            "dropped tail event": self.tampered(rows=self.rows[:-1]),
+            "reordered events": self.tampered(
+                rows=[self.rows[1], self.rows[0], *self.rows[2:]]
+            ),
+        }
+        for name, (record, rows) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ReplayError):
+                    verify_world(record, rows)
+
+    def test_recorded_outcomes_must_match_the_verified_log(self):
+        accepted = dict(
+            outcome="accepted",
+            reason=None,
+            version=2,
+            state_sha256=self.events[1].state_sha256,
+            event_version=2,
+        )
+        result = recorded_result(operation(**accepted), self.start, self.events)
+        self.assertEqual(summary(result), (True, None, 2, True))
+        self.assertEqual(result.event, self.events[1])
+
+        rejected = dict(
+            outcome="rejected",
+            reason="can_empty",
+            version=0,
+            state_sha256=self.start.digest,
+            event_version=None,
+        )
+        self.assertEqual(
+            summary(recorded_result(operation(**rejected), self.start, self.events)),
+            (False, "can_empty", 0, True),
+        )
+
+        bad = {
+            "accepted digest of another event": {
+                **accepted, "state_sha256": self.events[2].state_sha256
+            },
+            "accepted beyond log": {**accepted, "version": 5, "event_version": 5},
+            "accepted without event": {**accepted, "event_version": None},
+            "accepted with reason": {**accepted, "reason": "can_empty"},
+            "rejected digest mismatch": {
+                **rejected, "state_sha256": self.events[0].state_sha256
+            },
+            "rejected beyond log": {**rejected, "version": 9},
+            "rejected unknown reason": {**rejected, "reason": "because"},
+            "rejected with event": {**rejected, "event_version": 0},
+            "unknown outcome": {**rejected, "outcome": "maybe"},
+            "bool version": {**rejected, "version": False},
+        }
+        for name, fields in bad.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ReplayError):
+                    recorded_result(operation(**fields), self.start, self.events)
 
 
 class PureTests(unittest.TestCase):
@@ -281,8 +437,9 @@ class PureTests(unittest.TestCase):
                 with self.assertRaises(ReplayError):
                     event_from_record(WorldEventRecord(**{**good, **change}))
 
-    def test_orm_constraint_names_appear_in_migration(self):
+    def test_orm_constraints_appear_in_migration(self):
         migration = MIGRATION.read_text()
+        flat = " ".join(migration.split())
         self.assertIn("Applied: pending", migration)
         for table in Base.metadata.sorted_tables:
             self.assertIn(f"CREATE TABLE public.{table.name} (", migration)
@@ -290,6 +447,54 @@ class PureTests(unittest.TestCase):
                 with self.subTest(table=table.name, constraint=constraint.name):
                     self.assertIsNotNone(constraint.name)
                     self.assertIn(f"CONSTRAINT {constraint.name} ", migration)
+                    if isinstance(constraint, CheckConstraint):
+                        # Same expression text, modulo whitespace.
+                        self.assertIn(" ".join(str(constraint.sqltext).split()), flat)
+
+    def test_orm_columns_appear_in_migration(self):
+        migration = MIGRATION.read_text()
+        for table in Base.metadata.sorted_tables:
+            block = migration.split(f"CREATE TABLE public.{table.name} (", 1)[1].split("\n);", 1)[0]
+            declared = re.findall(r"^    ([a-z_0-9]+) (?!KEY)", block, re.MULTILINE)
+            with self.subTest(table=table.name):
+                self.assertEqual(sorted(declared), sorted(table.columns.keys()))
+
+    def test_database_guard_refuses_unsafe_urls_without_connecting(self):
+        unsafe = {
+            "postgres default db": "postgresql+psycopg://u:p@127.0.0.1:55432/postgres",
+            "template1": "postgresql+psycopg://u:p@127.0.0.1:55432/template1",
+            "template0": "postgresql+psycopg://u:p@127.0.0.1:55432/template0",
+            "app-like db": "postgresql+psycopg://u:p@127.0.0.1:55432/server",
+            "bare prefix": "postgresql+psycopg://u:p@127.0.0.1:55432/leo186_test_",
+            "prefix lookalike": "postgresql+psycopg://u:p@127.0.0.1:55432/leo186_testx",
+            "uppercase": "postgresql+psycopg://u:p@127.0.0.1:55432/LEO186_TEST_A",
+            "suffix injection": "postgresql+psycopg://u:p@127.0.0.1:55432/leo186_test_a;drop",
+            "no database": "postgresql+psycopg://u:p@127.0.0.1:55432",
+            "default port": "postgresql+psycopg://u:p@127.0.0.1:5432/leo186_test_a",
+            "implicit port": "postgresql+psycopg://u:p@127.0.0.1/leo186_test_a",
+            "docker db host": "postgresql+psycopg://u:p@db:55432/leo186_test_a",
+            "lan host": "postgresql+psycopg://u:p@192.168.1.5:55432/leo186_test_a",
+            "no host": "postgresql+psycopg://u:p@/leo186_test_a",
+            "socket override": "postgresql+psycopg://u:p@127.0.0.1:55432/leo186_test_a?host=/run/pg",
+            "options override": (
+                "postgresql+psycopg://u:p@127.0.0.1:55432/leo186_test_a?options=-csearch_path%3Dx"
+            ),
+            "other driver": "postgresql://u:p@127.0.0.1:55432/leo186_test_a",
+            "sqlite": "sqlite:///leo186_test_a",
+            "garbage": "not a url",
+        }
+        with mock.patch(f"{__name__}.create_engine", side_effect=AssertionError("connected")):
+            for name, value in unsafe.items():
+                with self.subTest(name=name):
+                    with self.assertRaises(UnsafeTestDatabase):
+                        disposable_url(value)
+            for value in (None, ""):
+                with self.assertRaises(unittest.SkipTest):
+                    disposable_url(value)
+            accepted = disposable_url(
+                "postgresql+psycopg://leo186:synthetic@127.0.0.1:55432/leo186_test_run1"
+            )
+        self.assertEqual(accepted.database, "leo186_test_run1")
 
     def test_import_creates_no_engine_or_app_database(self):
         probe = (
@@ -303,15 +508,38 @@ class PureTests(unittest.TestCase):
         self.assertEqual(output.stdout.strip(), "[]")
 
 
-def disposable_url() -> str:
-    url = os.environ.get(URL_ENV)
-    if not url:
+class UnsafeTestDatabase(RuntimeError):
+    """The configured URL is not a designated disposable LEO-186 database."""
+
+
+def disposable_url(value: str | None) -> URL:
+    """Accept only a designated disposable local test database, offline.
+
+    This runs before any engine, connection, migration, or DROP.  It needs
+    the psycopg driver, a loopback host, an explicit non-default port (the
+    live stack's 5432 is refused), no query overrides such as ``host=`` or
+    ``options=``, and a database named ``leo186_test_<suffix>``.  So
+    ``postgres``, ``template*``, and any application database are refused.
+    """
+
+    if not value:
         raise unittest.SkipTest(
             f"{URL_ENV} is not set; real PostgreSQL evidence is unavailable"
         )
-    parsed = make_url(url)
-    if parsed.drivername != "postgresql+psycopg" or parsed.host not in LOCAL_HOSTS:
-        raise RuntimeError(f"{URL_ENV} must be a disposable local postgresql+psycopg:// URL")
+    try:
+        url = make_url(value)
+    except Exception as exc:
+        raise UnsafeTestDatabase(f"{URL_ENV} is not a parseable database URL") from exc
+    if url.drivername != "postgresql+psycopg":
+        raise UnsafeTestDatabase(f"{URL_ENV} must use postgresql+psycopg://")
+    if url.host not in LOCAL_HOSTS:
+        raise UnsafeTestDatabase(f"{URL_ENV} host must be loopback")
+    if url.port is None or url.port == DEFAULT_POSTGRES_PORT:
+        raise UnsafeTestDatabase(f"{URL_ENV} needs an explicit non-default port")
+    if url.query:
+        raise UnsafeTestDatabase(f"{URL_ENV} must not carry query parameters")
+    if not isinstance(url.database, str) or not TEST_DATABASE_NAME.fullmatch(url.database):
+        raise UnsafeTestDatabase(f"{URL_ENV} database must match {TEST_DATABASE_NAME.pattern}")
     return url
 
 
@@ -333,9 +561,15 @@ class PostgresWorldStoreTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.url = disposable_url()
+        # Guard first: nothing below connects, migrates, or drops until the
+        # URL names a designated disposable local database.
+        cls.url = disposable_url(os.environ.get(URL_ENV))
         cls.engine = create_engine(cls.url, pool_pre_ping=True)
         with cls.engine.begin() as connection:
+            connected_to = connection.exec_driver_sql("SELECT current_database()").scalar_one()
+            if connected_to != cls.url.database:
+                cls.engine.dispose()
+                raise UnsafeTestDatabase("connected database differs from the guarded name")
             connection.exec_driver_sql(
                 "DROP TABLE IF EXISTS world_operations, world_events, world_states CASCADE"
             )
@@ -379,26 +613,65 @@ class PostgresWorldStoreTests(unittest.TestCase):
             ).scalar_one()
 
     def head(self, world_id: str) -> tuple:
+        """(version, digest, canonical snapshot) as stored."""
+
         with self.engine.connect() as connection:
             return tuple(
                 connection.execute(
-                    text("SELECT head_version, head_sha256 FROM world_states WHERE world_id = :w"),
+                    text(
+                        "SELECT head_version, head_sha256, head_state "
+                        "FROM world_states WHERE world_id = :w"
+                    ),
                     {"w": world_id},
                 ).one()
             )
 
-    def advanced_world(self, world_id: str) -> WorldState:
-        """Create a world and commit move→refill; returns the committed state."""
+    def advanced_world(self, world_id: str, steps=(("move", WELL), ("refill", WELL))):
+        """Create a world and commit ``steps``; return the state and proposals."""
 
         state = initial_state()
         self.store.create(world_id, state)
-        for step, (action, target) in enumerate((("move", WELL), ("refill", WELL))):
-            result = self.store.submit(
-                world_id, adapter_proposal(state, action, target), f"step-{step}"
-            )
+        proposals = {}
+        for step, (action, target) in enumerate(steps):
+            key = f"step-{step}"
+            proposals[key] = adapter_proposal(state, action, target)
+            result = self.store.submit(world_id, proposals[key], key)
             self.assertTrue(result.accepted, (action, result.reason))
             state = self.store.load(world_id).state
-        return state
+            self.assertEqual(self.head(world_id), (state.version, state.digest, state.as_mapping()))
+        return state, proposals
+
+    def test_full_sequence_is_restored_by_a_fresh_process(self):
+        committed, proposals = self.advanced_world("world-full", FULL_SEQUENCE)
+        self.assertEqual(
+            (committed.version, committed.location, committed.can_level, committed.herb_bed_watered),
+            (4, HERB_BED, 2, True),
+        )
+        [(status, restored)] = self.run_processes(
+            [
+                lambda s: (
+                    lambda w: (
+                        w.state.version,
+                        w.state.digest,
+                        w.state.location,
+                        w.state.can_level,
+                        w.state.herb_bed_watered,
+                        [event.event_id for event in w.events],
+                    )
+                )(s.load("world-full"))
+            ],
+            simultaneous=False,
+        )
+        self.assertEqual(status, "ok")
+        self.assertEqual(
+            restored,
+            (4, committed.digest, HERB_BED, 2, True, [f"world-event-{v}" for v in range(1, 5)]),
+        )
+        # A retry after restart replays the recorded outcome with no new event.
+        retry = self.store.submit("world-full", proposals["step-3"], "step-3")
+        self.assertEqual(summary(retry), (True, None, 4, True))
+        self.assertEqual(self.count("world_events", "world-full"), 4)
+        self.assertEqual(self.store.load("world-full").state, committed)
 
     def test_create_is_idempotent_and_conflicts_on_different_input(self):
         start = initial_state()
@@ -485,7 +758,7 @@ class PostgresWorldStoreTests(unittest.TestCase):
         self.assertEqual(self.count("world_operations", "world-dup-race"), 1)
 
     def test_process_restart_restores_state_and_continues(self):
-        committed = self.advanced_world("world-restart")
+        committed, _ = self.advanced_world("world-restart")
         [(status, restored)] = self.run_processes(
             [
                 lambda s: (
@@ -537,7 +810,7 @@ class PostgresWorldStoreTests(unittest.TestCase):
             (False, "can_empty", 0, True),
         )
 
-    def test_tampered_storage_is_rejected_on_load_and_submit(self):
+    def test_tampered_storage_is_refused_on_load_submit_and_retry(self):
         tampering = {
             "event target": "UPDATE world_events SET target = 'herb-bed' "
             "WHERE world_id = :w AND version = 1",
@@ -545,9 +818,17 @@ class PostgresWorldStoreTests(unittest.TestCase):
             "WHERE world_id = :w AND version = 2",
             "event digest": "UPDATE world_events SET state_sha256 = repeat('0', 64) "
             "WHERE world_id = :w AND version = 2",
+            "event digest from another valid event": "UPDATE world_events SET state_sha256 = "
+            "(SELECT state_sha256 FROM world_events WHERE world_id = :w AND version = 1) "
+            "WHERE world_id = :w AND version = 2",
             "head digest": "UPDATE world_states SET head_sha256 = repeat('0', 64) "
             "WHERE world_id = :w",
-            "head version": "UPDATE world_states SET head_version = 1 WHERE world_id = :w",
+            "head version and snapshot version": "UPDATE world_states SET head_version = 1, "
+            "head_state = jsonb_set(head_state, '{version}', '1') WHERE world_id = :w",
+            "consistent other head snapshot": "UPDATE world_states SET "
+            "head_state = CAST(:s AS jsonb), head_sha256 = :d WHERE world_id = :w",
+            "head int for bool": "UPDATE world_states SET head_state = "
+            "jsonb_set(head_state, '{well,available}', '1') WHERE world_id = :w",
             "dropped tail": "DELETE FROM world_operations WHERE world_id = :w "
             "AND event_version = 2; DELETE FROM world_events WHERE world_id = :w AND version = 2",
             "initial int for bool": "UPDATE world_states SET initial_state = "
@@ -558,16 +839,28 @@ class PostgresWorldStoreTests(unittest.TestCase):
         for index, (name, statement) in enumerate(tampering.items()):
             world_id = f"world-tamper-{index}"
             with self.subTest(name=name):
-                state = self.advanced_world(world_id)
+                state, proposals = self.advanced_world(world_id)
+                # Same version and schema, valid digest, but not what the log says.
+                other = dataclasses.replace(state, can_level=0)
+                params = {"w": world_id, "s": json.dumps(other.as_mapping()), "d": other.digest}
                 with self.engine.begin() as connection:
                     for part in statement.split("; "):
-                        connection.execute(text(part), {"w": world_id})
+                        connection.execute(
+                            text(part), {k: v for k, v in params.items() if f":{k}" in part}
+                        )
                 operations = self.count("world_operations", world_id)
+                events = self.count("world_events", world_id)
+                head = self.head(world_id)
                 with self.assertRaises(ReplayError):
                     self.store.load(world_id)
                 with self.assertRaises(ReplayError):
                     self.store.submit(world_id, adapter_proposal(state, "wait", None), "after")
+                # A retry of a recorded acceptance is not reported as accepted.
+                with self.assertRaises(ReplayError):
+                    self.store.submit(world_id, proposals["step-1"], "step-1")
                 self.assertEqual(self.count("world_operations", world_id), operations)
+                self.assertEqual(self.count("world_events", world_id), events)
+                self.assertEqual(self.head(world_id), head)
 
     def test_failure_mid_transaction_rolls_back_event_and_head(self):
         start = initial_state()
@@ -591,10 +884,13 @@ class PostgresWorldStoreTests(unittest.TestCase):
         self.assertEqual(seen, [1])  # the event row was written, then rolled back
         self.assertEqual(self.count("world_events", "world-rollback"), 0)
         self.assertEqual(self.count("world_operations", "world-rollback"), 0)
-        self.assertEqual(self.head("world-rollback"), (0, start.digest))
+        self.assertEqual(self.head("world-rollback"), (0, start.digest, start.as_mapping()))
+        self.assertEqual(self.store.load("world-rollback").state, start)
 
         retry = self.store.submit("world-rollback", to_well, "key-1")
         self.assertEqual(summary(retry), (True, None, 1, False))
+        moved = self.store.load("world-rollback").state
+        self.assertEqual(self.head("world-rollback"), (1, moved.digest, moved.as_mapping()))
 
     def test_no_visitor_or_reply_text_is_stored(self):
         start = initial_state()
