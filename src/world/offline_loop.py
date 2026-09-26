@@ -8,11 +8,19 @@ This module demonstrates one bounded decision cycle for a single resident:
     -> adapter JSON parsing -> untrusted proposal -> engine validation
     -> new versioned state + event (or a rejection with the state unchanged)
 
-The world is deliberately tiny: one resident, one water can with a finite
-capacity, one well that may be unavailable, and one herb bed.  The allowed
-actions are ``refill`` (target ``well``), ``water`` (target ``herb-bed``),
-``wait`` (no target), and ``talk`` (target ``visitor``).  ``talk`` records
+The world is deliberately tiny: one resident at one of three places
+(``well``, ``herb-bed``, ``elsewhere``), one water can with a finite capacity,
+one well that may be unavailable, and one herb bed.  The actions are ``move``
+(target: another place), ``refill`` (target ``well``, only while at the well),
+``water`` (target ``herb-bed``, only while at the bed), ``wait`` (no target),
+and ``talk`` (target ``visitor``).  Moving is one direct step between named
+places; there is no pathfinding, travel time, or schedule.  ``talk`` records
 only that the action occurred; no reply text or transcript is kept.
+
+Offers and validation share one pure precondition check.  The context lists
+only actions that are currently possible for the resident's capabilities,
+place, and state.  The engine re-runs the same check at commit time and never
+trusts the offer list, so a stale or unoffered choice cannot mutate state.
 
 The engine is authoritative.  A model reply supplies only an action name and
 target; the actor is bound from the assembled persona context and the state
@@ -67,23 +75,28 @@ from personas import (
 )
 
 
-SCHEMA = "offline-world/v1"
+SCHEMA = "offline-world/v2"
 WELL = "well"
 HERB_BED = "herb-bed"
+ELSEWHERE = "elsewhere"
 VISITOR = "visitor"
+LOCATIONS = (ELSEWHERE, HERB_BED, WELL)
 MAX_IDENTIFIER_LENGTH = 128
 MAX_CAN_CAPACITY = 100
 MAX_WORLD_VERSION = 4_096
 WORLD_STATE_ITEM_ID = "offline-world-state"
 
-# Each allowed action and the single target it accepts.
-ACTION_TARGETS: dict[str, str | None] = {
-    "refill": WELL,
-    "water": HERB_BED,
-    "wait": None,
-    "talk": VISITOR,
+# Each action and the targets it can ever accept; preconditions narrow these.
+ACTION_TARGETS: dict[str, tuple[str | None, ...]] = {
+    "move": LOCATIONS,
+    "refill": (WELL,),
+    "talk": (VISITOR,),
+    "wait": (None,),
+    "water": (HERB_BED,),
 }
 ACTIONS = frozenset(ACTION_TARGETS)
+# Where the resident must stand for a place-bound action.
+REQUIRED_LOCATION: dict[str, str] = {"refill": WELL, "water": HERB_BED}
 
 # Internal convention marking proposals produced by the adapter path below.
 _ADAPTER_ORIGIN = object()
@@ -115,6 +128,8 @@ class RejectionReason(str, Enum):
     UNKNOWN_ACTION = "unknown_action"
     CAPABILITY_DENIED = "capability_denied"
     INVALID_TARGET = "invalid_target"
+    ALREADY_THERE = "already_there"
+    WRONG_LOCATION = "wrong_location"
     WELL_UNAVAILABLE = "well_unavailable"
     CAN_ALREADY_FULL = "can_already_full"
     CAN_EMPTY = "can_empty"
@@ -174,6 +189,7 @@ class WorldState:
 
     version: int
     resident: Resident
+    location: str
     can_capacity: int
     can_level: int
     well_available: bool
@@ -183,6 +199,8 @@ class WorldState:
         _integer(self.version, "version", 0, MAX_WORLD_VERSION)
         if not isinstance(self.resident, Resident):
             raise WorldError("resident must be a Resident")
+        if self.location not in LOCATIONS:
+            raise WorldError("location must be a known place")
         _integer(self.can_capacity, "can_capacity", 1, MAX_CAN_CAPACITY)
         _integer(self.can_level, "can_level", 0, self.can_capacity)
         _boolean(self.well_available, "well_available")
@@ -193,6 +211,7 @@ class WorldState:
             "herb_bed": {"watered": self.herb_bed_watered},
             "resident": {
                 "capabilities": sorted(self.resident.capabilities),
+                "location": self.location,
                 "resident_id": self.resident.resident_id,
             },
             "schema": SCHEMA,
@@ -209,6 +228,7 @@ class WorldState:
 def initial_state(
     *,
     resident_id: str = "leo",
+    location: str = ELSEWHERE,
     can_capacity: int = 3,
     can_level: int = 0,
     well_available: bool = True,
@@ -220,6 +240,7 @@ def initial_state(
     return WorldState(
         version=0,
         resident=Resident(resident_id, frozenset(capabilities)),
+        location=location,
         can_capacity=can_capacity,
         can_level=can_level,
         well_available=well_available,
@@ -277,10 +298,10 @@ def _reject(state: WorldState, reason: RejectionReason) -> Decision:
     return Decision(accepted=False, state=state, event=None, reason=reason)
 
 
-def _transition(
+def _precondition(
     state: WorldState, actor_id: str, action: str, target: str | None
-) -> WorldState | RejectionReason:
-    """Validate actor, action, capability, target, and preconditions purely."""
+) -> RejectionReason | None:
+    """The single pure check shared by offer generation and commit validation."""
 
     if actor_id != state.resident.resident_id:
         return RejectionReason.ACTOR_MISMATCH
@@ -290,27 +311,61 @@ def _transition(
         return RejectionReason.UNKNOWN_ACTION
     if action not in state.resident.capabilities:
         return RejectionReason.CAPABILITY_DENIED
-    if target != ACTION_TARGETS[action]:
+    if target not in ACTION_TARGETS[action]:
         return RejectionReason.INVALID_TARGET
-
-    can_level = state.can_level
-    watered = state.herb_bed_watered
+    if action == "move" and target == state.location:
+        return RejectionReason.ALREADY_THERE
+    if action in REQUIRED_LOCATION and state.location != REQUIRED_LOCATION[action]:
+        return RejectionReason.WRONG_LOCATION
     if action == "refill":
         if not state.well_available:
             return RejectionReason.WELL_UNAVAILABLE
-        if can_level == state.can_capacity:
+        if state.can_level == state.can_capacity:
             return RejectionReason.CAN_ALREADY_FULL
+    elif action == "water":
+        if state.can_level == 0:
+            return RejectionReason.CAN_EMPTY
+        if state.herb_bed_watered:
+            return RejectionReason.BED_ALREADY_WATERED
+    return None
+
+
+def possible_actions(state: WorldState) -> tuple[tuple[str, str | None], ...]:
+    """Every (action, target) the resident could commit right now, in order."""
+
+    if not isinstance(state, WorldState):
+        raise WorldError("state must be a WorldState")
+    actor_id = state.resident.resident_id
+    return tuple(
+        (action, target)
+        for action in sorted(state.resident.capabilities)
+        for target in ACTION_TARGETS[action]
+        if _precondition(state, actor_id, action, target) is None
+    )
+
+
+def _transition(
+    state: WorldState, actor_id: str, action: str, target: str | None
+) -> WorldState | RejectionReason:
+    """Re-check preconditions authoritatively, then derive the next state."""
+
+    reason = _precondition(state, actor_id, action, target)
+    if reason is not None:
+        return reason
+    location = state.location
+    can_level = state.can_level
+    watered = state.herb_bed_watered
+    if action == "move":
+        location = target
+    elif action == "refill":
         can_level = state.can_capacity
     elif action == "water":
-        if can_level == 0:
-            return RejectionReason.CAN_EMPTY
-        if watered:
-            return RejectionReason.BED_ALREADY_WATERED
         can_level -= 1
         watered = True
     return WorldState(
         version=state.version + 1,
         resident=state.resident,
+        location=location,
         can_capacity=state.can_capacity,
         can_level=can_level,
         well_available=state.well_available,
@@ -377,12 +432,16 @@ def replay(initial: WorldState, events: Iterable[WorldEvent]) -> WorldState:
 
 
 def world_state_item(state: WorldState, *, resident_id: str) -> ContextItem:
-    """Serialize observable world state as mandatory, non-approved context."""
+    """Serialize world state and currently possible offers as context.
+
+    The offers are advice for the model only; the engine re-validates any
+    choice at commit and does not consult this list.
+    """
 
     payload = {
-        "allowed_actions": [
-            {"action": action, "target": ACTION_TARGETS[action]}
-            for action in sorted(state.resident.capabilities)
+        "offered_actions": [
+            {"action": action, "target": target}
+            for action, target in possible_actions(state)
         ],
         "reply_format": {"action": "string", "reply": "string", "target": "string|null"},
         "world": state.as_mapping(),
