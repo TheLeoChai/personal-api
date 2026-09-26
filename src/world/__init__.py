@@ -1,7 +1,8 @@
 """Offline synthetic one-resident world loop.
 
 Importing this package performs no network access, credential discovery,
-model call, storage, or application startup.
+model call, storage, or application startup.  PostgreSQL persistence is the
+separate ``world.postgres`` module, which is not imported here.
 """
 
 from .offline_loop import (
@@ -28,6 +29,7 @@ from .offline_loop import (
     possible_actions,
     replay,
     run_offline_turn,
+    state_from_mapping,
     world_state_item,
 )
 
@@ -55,5 +57,6 @@ __all__ = [
     "possible_actions",
     "replay",
     "run_offline_turn",
+    "state_from_mapping",
     "world_state_item",
 ]
