@@ -47,6 +47,7 @@ from world import (
     possible_actions,
     replay,
     run_offline_turn,
+    state_from_mapping,
 )
 
 
@@ -566,6 +567,72 @@ class OfflineLoopTests(unittest.TestCase):
                 well_available=True,
                 herb_bed_watered=False,
             )
+
+
+class StateDecodingTests(unittest.TestCase):
+    """``state_from_mapping`` is the strict inverse of ``as_mapping``."""
+
+    def test_known_states_round_trip_through_json(self):
+        states = [
+            initial_state(),
+            initial_state(location=WELL, can_capacity=100, can_level=100, well_available=False),
+            initial_state(location=HERB_BED, can_level=2, herb_bed_watered=True),
+            initial_state(resident_id="résident-ü", capabilities=()),
+            initial_state(capabilities={"wait", "talk"}),
+            dataclasses.replace(initial_state(), version=4_096),
+        ]
+        for state in states:
+            with self.subTest(state=state):
+                decoded = state_from_mapping(json.loads(json.dumps(state.as_mapping())))
+                self.assertEqual(decoded, state)
+                self.assertEqual(decoded.digest, state.digest)
+
+    def test_malformed_mappings_are_rejected(self):
+        good = initial_state(location=WELL, can_level=1).as_mapping()
+
+        def edited(path, value, *, delete=False):
+            mapping = json.loads(json.dumps(good))
+            target = mapping
+            for key in path[:-1]:
+                target = target[key]
+            if delete:
+                del target[path[-1]]
+            else:
+                target[path[-1]] = value
+            return mapping
+
+        cases = {
+            "not an object": [],
+            "bool version": edited(("version",), True),
+            "float version": edited(("version",), 1.0),
+            "nan version": edited(("version",), float("nan")),
+            "negative version": edited(("version",), -1),
+            "version too large": edited(("version",), 4_097),
+            "int for bool": edited(("well", "available"), 1),
+            "string for bool": edited(("herb_bed", "watered"), "false"),
+            "bool capacity": edited(("water_can", "capacity"), True),
+            "level above capacity": edited(("water_can", "level"), 4),
+            "capacity too large": edited(("water_can", "capacity"), 101),
+            "unknown schema": edited(("schema",), "offline-world/v1"),
+            "extra top-level key": edited(("clock",), 0),
+            "extra nested key": edited(("resident", "mood"), "happy"),
+            "missing key": edited(("well",), None, delete=True),
+            "nested not object": edited(("well",), [True]),
+            "unknown location": edited(("resident", "location"), "moon"),
+            "list location": edited(("resident", "location"), [WELL]),
+            "empty resident": edited(("resident", "resident_id"), ""),
+            "long resident": edited(("resident", "resident_id"), "x" * 129),
+            "unknown capability": edited(("resident", "capabilities"), ["fly"]),
+            "duplicate capability": edited(("resident", "capabilities"), ["wait", "wait"]),
+            "unsorted capabilities": edited(("resident", "capabilities"), ["wait", "move"]),
+            "string capabilities": edited(("resident", "capabilities"), "wait"),
+            "null resident": edited(("resident", "resident_id"), None),
+            "template location": edited(("resident", "location"), "{{ WELL }}"),
+        }
+        for name, mapping in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(WorldError):
+                    state_from_mapping(mapping)
 
 
 if __name__ == "__main__":

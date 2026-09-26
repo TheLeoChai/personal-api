@@ -36,11 +36,12 @@ Fake versus real
 ``InferenceMode.OFFLINE_FAKE_FIXTURE``: the model reply came from a caller's
 offline fixture, not from real inference, and the permit is synthetic rather
 than real quota enforcement.  Real inference, provider disclosure of persona
-context, durable admission accounting, persistence, restart recovery, shared
+context, durable admission accounting, world time or downtime catch-up, shared
 or multi-resident worlds, and any public endpoint remain deferred launch gates.
 
 State and events are pure immutable values.  Nothing here stores data, reads
-the environment, opens sockets, or runs on a clock of its own.
+the environment, opens sockets, or runs on a clock of its own.  Durable
+storage of one world and its events lives in ``world.postgres``.
 """
 
 from __future__ import annotations
@@ -223,6 +224,53 @@ class WorldState:
     @property
     def digest(self) -> str:
         return _sha256(_canonical(self.as_mapping()))
+
+
+def _exact_mapping(value: object, keys: frozenset[str], field_name: str) -> dict:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise WorldError(f"{field_name} must be an object with exactly {sorted(keys)}")
+    return value
+
+
+def state_from_mapping(value: object) -> WorldState:
+    """Strictly decode ``WorldState.as_mapping`` output, e.g. stored JSON.
+
+    Only the exact known keys and JSON types are accepted.  Nothing is
+    defaulted, coerced, or evaluated; ``WorldState`` re-checks every bound
+    (so ``True`` is not an integer and ``1`` is not a boolean).
+    """
+
+    root = _exact_mapping(
+        value,
+        frozenset({"herb_bed", "resident", "schema", "version", "water_can", "well"}),
+        "world",
+    )
+    if root["schema"] != SCHEMA:
+        raise WorldError("world schema is not supported")
+    resident = _exact_mapping(
+        root["resident"], frozenset({"capabilities", "location", "resident_id"}), "resident"
+    )
+    capabilities = resident["capabilities"]
+    if (
+        not isinstance(capabilities, list)
+        or not all(isinstance(name, str) for name in capabilities)
+        or capabilities != sorted(set(capabilities))
+    ):
+        raise WorldError("capabilities must be a sorted list of unique action names")
+    if not isinstance(resident["location"], str):
+        raise WorldError("location must be a known place")
+    can = _exact_mapping(root["water_can"], frozenset({"capacity", "level"}), "water_can")
+    well = _exact_mapping(root["well"], frozenset({"available"}), "well")
+    bed = _exact_mapping(root["herb_bed"], frozenset({"watered"}), "herb_bed")
+    return WorldState(
+        version=root["version"],
+        resident=Resident(resident["resident_id"], frozenset(capabilities)),
+        location=resident["location"],
+        can_capacity=can["capacity"],
+        can_level=can["level"],
+        well_available=well["available"],
+        herb_bed_watered=bed["watered"],
+    )
 
 
 def initial_state(

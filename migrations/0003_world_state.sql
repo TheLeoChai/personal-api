@@ -1,0 +1,83 @@
+-- 0003: durable synthetic one-resident world head + ordered events (LEO-186).
+-- Applied: pending; authored 2026-09-26, intentionally not applied to live.
+-- Offline-fixture world only.  No raw visitor or model reply text is stored.
+-- No HTTP endpoint.  World time and downtime catch-up are undecided and
+-- deliberately absent.  Mirrors the ORM in src/world/postgres.py.
+
+-- world_states keeps the canonical current head snapshot (head_state) next
+-- to the version-zero initial snapshot.  Both carry the state schema tag;
+-- the application re-derives head_state by replay on every load and submit.
+CREATE TABLE public.world_states (
+    world_id text NOT NULL,
+    state_schema text NOT NULL,
+    initial_state jsonb NOT NULL,
+    initial_sha256 character(64) NOT NULL,
+    head_state jsonb NOT NULL,
+    head_version bigint NOT NULL,
+    head_sha256 character(64) NOT NULL,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT world_states_pkey PRIMARY KEY (world_id),
+    CONSTRAINT world_state_id_ck CHECK (char_length(world_id) BETWEEN 1 AND 128),
+    CONSTRAINT world_state_schema_ck CHECK (state_schema = 'offline-world/v2'),
+    -- A missing key makes `->` SQL NULL and a CHECK passes on NULL, so each
+    -- snapshot check is wrapped in `(...) IS TRUE`, which fails closed.
+    CONSTRAINT world_state_initial_ck CHECK ((jsonb_typeof(initial_state) = 'object'
+        AND initial_state -> 'schema' = to_jsonb(state_schema)
+        AND initial_state -> 'version' = '0'::jsonb) IS TRUE),
+    CONSTRAINT world_state_head_ck CHECK ((jsonb_typeof(head_state) = 'object'
+        AND head_state -> 'schema' = to_jsonb(state_schema)
+        AND head_state -> 'version' = to_jsonb(head_version)) IS TRUE),
+    CONSTRAINT world_state_head_version_ck CHECK (head_version BETWEEN 0 AND 4096),
+    CONSTRAINT world_state_sha256_ck CHECK (
+        initial_sha256 ~ '^[0-9a-f]{64}$' AND head_sha256 ~ '^[0-9a-f]{64}$'
+    )
+);
+
+CREATE TABLE public.world_events (
+    world_id text NOT NULL,
+    version bigint NOT NULL,
+    prior_version bigint NOT NULL,
+    event_id text NOT NULL,
+    actor_id text NOT NULL,
+    action text NOT NULL,
+    target text,
+    inference_mode text NOT NULL,
+    context_sha256 character(64) NOT NULL,
+    state_sha256 character(64) NOT NULL,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT world_events_pkey PRIMARY KEY (world_id, version),
+    CONSTRAINT world_event_world_fk FOREIGN KEY (world_id)
+        REFERENCES public.world_states(world_id),
+    CONSTRAINT world_event_version_ck CHECK (
+        version BETWEEN 1 AND 4096 AND prior_version = version - 1
+    ),
+    CONSTRAINT world_event_id_ck CHECK (event_id = 'world-event-' || version),
+    CONSTRAINT world_event_mode_ck CHECK (inference_mode = 'offline-fake-fixture'),
+    CONSTRAINT world_event_sha256_ck CHECK (
+        context_sha256 ~ '^[0-9a-f]{64}$' AND state_sha256 ~ '^[0-9a-f]{64}$'
+    )
+);
+
+CREATE TABLE public.world_operations (
+    world_id text NOT NULL,
+    idempotency_key text NOT NULL,
+    request_fingerprint character(64) NOT NULL,
+    outcome text NOT NULL,
+    reason text,
+    version bigint NOT NULL,
+    state_sha256 character(64) NOT NULL,
+    event_version bigint,
+    created_at timestamp with time zone NOT NULL DEFAULT now(),
+    CONSTRAINT world_operations_pkey PRIMARY KEY (world_id, idempotency_key),
+    CONSTRAINT world_operation_world_fk FOREIGN KEY (world_id)
+        REFERENCES public.world_states(world_id),
+    CONSTRAINT world_operation_event_fk FOREIGN KEY (world_id, event_version)
+        REFERENCES public.world_events(world_id, version),
+    CONSTRAINT world_operation_event_uq UNIQUE (world_id, event_version),
+    CONSTRAINT world_operation_key_ck CHECK (char_length(idempotency_key) BETWEEN 1 AND 255),
+    CONSTRAINT world_operation_shape_ck CHECK (
+        (outcome = 'accepted' AND reason IS NULL
+            AND event_version IS NOT NULL AND event_version = version)
+        OR (outcome = 'rejected' AND reason IS NOT NULL AND event_version IS NULL)
+    )
+);
