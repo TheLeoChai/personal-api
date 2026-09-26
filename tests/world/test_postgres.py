@@ -27,6 +27,7 @@ from unittest import mock
 
 from sqlalchemy import CheckConstraint, create_engine, func, select, text
 from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import IntegrityError
 
 from inference.openrouter import PermitReservation
 from personas import (
@@ -173,6 +174,47 @@ def forged_proposal(state: WorldState, action: str, target: str | None) -> Actio
             accounting_state="settled_completed",
         ),
     )
+
+
+def normalized_sql(sql: str) -> str:
+    return " ".join(sql.split()).replace("( ", "(").replace(" )", ")")
+
+
+def migration_check(migration: str, name: str) -> str:
+    """The full expression inside ``CONSTRAINT <name> CHECK (...)``."""
+
+    start = migration.index(f"CONSTRAINT {name} CHECK (") + len(f"CONSTRAINT {name} CHECK (")
+    depth, quoted = 1, False
+    for index in range(start, len(migration)):
+        char = migration[index]
+        if char == "'":
+            quoted = not quoted
+        elif not quoted and char == "(":
+            depth += 1
+        elif not quoted and char == ")":
+            depth -= 1
+            if depth == 0:
+                return normalized_sql(migration[start:index])
+    raise AssertionError(f"unbalanced CHECK {name}")
+
+
+def wrapped_in_is_true(expression: str) -> bool:
+    """True when the WHOLE expression is ``(...) IS TRUE``, not one conjunct."""
+
+    if not expression.startswith("(") or not expression.endswith(") IS TRUE"):
+        return False
+    body = expression[: -len(" IS TRUE")]
+    depth, quoted = 0, False
+    for index, char in enumerate(body):
+        if char == "'":
+            quoted = not quoted
+        elif not quoted and char == "(":
+            depth += 1
+        elif not quoted and char == ")":
+            depth -= 1
+            if depth == 0 and index != len(body) - 1:
+                return False
+    return depth == 0
 
 
 def summary(result) -> tuple:
@@ -439,7 +481,6 @@ class PureTests(unittest.TestCase):
 
     def test_orm_constraints_appear_in_migration(self):
         migration = MIGRATION.read_text()
-        flat = " ".join(migration.split())
         self.assertIn("Applied: pending", migration)
         for table in Base.metadata.sorted_tables:
             self.assertIn(f"CREATE TABLE public.{table.name} (", migration)
@@ -448,8 +489,39 @@ class PureTests(unittest.TestCase):
                     self.assertIsNotNone(constraint.name)
                     self.assertIn(f"CONSTRAINT {constraint.name} ", migration)
                     if isinstance(constraint, CheckConstraint):
-                        # Same expression text, modulo whitespace.
-                        self.assertIn(" ".join(str(constraint.sqltext).split()), flat)
+                        # The whole CHECK expression matches, modulo whitespace.
+                        self.assertEqual(
+                            migration_check(migration, constraint.name),
+                            normalized_sql(str(constraint.sqltext)),
+                        )
+
+    def test_json_snapshot_checks_fail_closed_on_null(self):
+        # ``->`` yields SQL NULL for a missing key or non-object, and a CHECK
+        # passes on NULL; each JSON check must be wrapped whole in IS TRUE.
+        migration = MIGRATION.read_text()
+        json_checks = [
+            constraint
+            for table in Base.metadata.sorted_tables
+            for constraint in table.constraints
+            if isinstance(constraint, CheckConstraint) and "->" in str(constraint.sqltext)
+        ]
+        self.assertEqual(
+            sorted(constraint.name for constraint in json_checks),
+            ["world_state_head_ck", "world_state_initial_ck"],
+        )
+        for constraint in json_checks:
+            orm = normalized_sql(str(constraint.sqltext))
+            for source, expression in (
+                ("orm", orm),
+                ("migration", migration_check(migration, constraint.name)),
+            ):
+                with self.subTest(constraint=constraint.name, source=source):
+                    self.assertTrue(wrapped_in_is_true(expression), expression)
+                    self.assertIn("jsonb_typeof(", expression)
+        # The helper itself refuses a wrap around only the last conjunct.
+        self.assertFalse(wrapped_in_is_true("(a -> 'x') = b AND (c = d) IS TRUE"))
+        self.assertFalse(wrapped_in_is_true("a -> 'x' = b"))
+        self.assertTrue(wrapped_in_is_true("(a -> 'x' = b AND (c) = d) IS TRUE"))
 
     def test_orm_columns_appear_in_migration(self):
         migration = MIGRATION.read_text()
@@ -688,6 +760,62 @@ class PostgresWorldStoreTests(unittest.TestCase):
             self.store.load("world-missing")
         with self.assertRaises(WorldNotFound):
             self.store.submit("world-missing", adapter_proposal(start, "wait", None), "k")
+
+    def test_snapshot_checks_reject_missing_null_and_wrong_types(self):
+        insert = text(
+            "INSERT INTO world_states (world_id, state_schema, initial_state, "
+            "initial_sha256, head_state, head_version, head_sha256) VALUES "
+            "(:w, :schema, CAST(:initial AS jsonb), :d, CAST(:head AS jsonb), 0, :d)"
+        )
+        minimal = json.dumps({"schema": SCHEMA, "version": 0})
+
+        def row(world_id, **snapshots):
+            return {
+                "w": world_id,
+                "schema": SCHEMA,
+                "d": "a" * 64,
+                "initial": snapshots.get("initial", minimal),
+                "head": snapshots.get("head", minimal),
+            }
+
+        # The DB check is a tripwire on schema tag and version only; the
+        # strict decoder still refuses this minimal snapshot on load.
+        with self.engine.begin() as connection:
+            connection.execute(insert, row("world-check-minimal"))
+
+        bad = {
+            "empty object": {},
+            "json null": None,  # JSON literal null, not SQL NULL
+            "array": [],
+            "string": "offline-world/v2",
+            "number": 0,
+            "missing schema": {"version": 0},
+            "missing version": {"schema": SCHEMA},
+            "null schema": {"schema": None, "version": 0},
+            "null version": {"schema": SCHEMA, "version": None},
+            "string version": {"schema": SCHEMA, "version": "0"},
+            "bool version": {"schema": SCHEMA, "version": False},
+            "wrong schema": {"schema": "offline-world/v1", "version": 0},
+            "nested schema": {"schema": {"schema": SCHEMA}, "version": 0},
+        }
+        for column, constraint in (
+            ("initial", "world_state_initial_ck"),
+            ("head", "world_state_head_ck"),
+        ):
+            for index, (name, snapshot) in enumerate(bad.items()):
+                with self.subTest(column=column, name=name):
+                    with self.assertRaises(IntegrityError) as caught:
+                        with self.engine.begin() as connection:
+                            connection.execute(
+                                insert,
+                                row(f"world-check-{column}-{index}", **{column: json.dumps(snapshot)}),
+                            )
+                    self.assertEqual(caught.exception.orig.sqlstate, "23514")
+                    self.assertEqual(caught.exception.orig.diag.constraint_name, constraint)
+        with self.engine.connect() as connection:
+            self.assertEqual(
+                connection.execute(text("SELECT count(*) FROM world_states")).scalar_one(), 1
+            )
 
     def test_concurrent_first_create_has_one_creator(self):
         start = initial_state()

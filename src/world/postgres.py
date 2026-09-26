@@ -114,16 +114,18 @@ class WorldRecord(Base):
             name="world_state_id_ck",
         ),
         CheckConstraint(f"state_schema = '{SCHEMA}'", name="world_state_schema_ck"),
+        # A missing key makes ``->`` SQL NULL and a CHECK passes on NULL, so
+        # snapshot checks are wrapped in ``(...) IS TRUE`` to fail closed.
         CheckConstraint(
-            "jsonb_typeof(initial_state) = 'object'"
+            "(jsonb_typeof(initial_state) = 'object'"
             " AND initial_state -> 'schema' = to_jsonb(state_schema)"
-            " AND initial_state -> 'version' = '0'::jsonb",
+            " AND initial_state -> 'version' = '0'::jsonb) IS TRUE",
             name="world_state_initial_ck",
         ),
         CheckConstraint(
-            "jsonb_typeof(head_state) = 'object'"
+            "(jsonb_typeof(head_state) = 'object'"
             " AND head_state -> 'schema' = to_jsonb(state_schema)"
-            " AND head_state -> 'version' = to_jsonb(head_version)",
+            " AND head_state -> 'version' = to_jsonb(head_version)) IS TRUE",
             name="world_state_head_ck",
         ),
         CheckConstraint(

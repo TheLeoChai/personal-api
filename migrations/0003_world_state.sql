@@ -19,16 +19,14 @@ CREATE TABLE public.world_states (
     CONSTRAINT world_states_pkey PRIMARY KEY (world_id),
     CONSTRAINT world_state_id_ck CHECK (char_length(world_id) BETWEEN 1 AND 128),
     CONSTRAINT world_state_schema_ck CHECK (state_schema = 'offline-world/v2'),
-    CONSTRAINT world_state_initial_ck CHECK (
-        jsonb_typeof(initial_state) = 'object'
+    -- A missing key makes `->` SQL NULL and a CHECK passes on NULL, so each
+    -- snapshot check is wrapped in `(...) IS TRUE`, which fails closed.
+    CONSTRAINT world_state_initial_ck CHECK ((jsonb_typeof(initial_state) = 'object'
         AND initial_state -> 'schema' = to_jsonb(state_schema)
-        AND initial_state -> 'version' = '0'::jsonb
-    ),
-    CONSTRAINT world_state_head_ck CHECK (
-        jsonb_typeof(head_state) = 'object'
+        AND initial_state -> 'version' = '0'::jsonb) IS TRUE),
+    CONSTRAINT world_state_head_ck CHECK ((jsonb_typeof(head_state) = 'object'
         AND head_state -> 'schema' = to_jsonb(state_schema)
-        AND head_state -> 'version' = to_jsonb(head_version)
-    ),
+        AND head_state -> 'version' = to_jsonb(head_version)) IS TRUE),
     CONSTRAINT world_state_head_version_ck CHECK (head_version BETWEEN 0 AND 4096),
     CONSTRAINT world_state_sha256_ck CHECK (
         initial_sha256 ~ '^[0-9a-f]{64}$' AND head_sha256 ~ '^[0-9a-f]{64}$'
