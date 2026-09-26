@@ -1,0 +1,49 @@
+"""Offline synthetic one-resident world loop.
+
+Importing this package performs no network access, credential discovery,
+model call, storage, or application startup.
+"""
+
+from .offline_loop import (
+    ACTION_TARGETS,
+    ACTIONS,
+    ActionProposal,
+    Decision,
+    InferenceMode,
+    OfflineOnlyError,
+    Provenance,
+    RejectionReason,
+    ReplayError,
+    Resident,
+    TurnResult,
+    WorldError,
+    WorldEvent,
+    WorldState,
+    apply_proposal,
+    initial_state,
+    replay,
+    run_offline_turn,
+    world_state_item,
+)
+
+__all__ = [
+    "ACTION_TARGETS",
+    "ACTIONS",
+    "ActionProposal",
+    "Decision",
+    "InferenceMode",
+    "OfflineOnlyError",
+    "Provenance",
+    "RejectionReason",
+    "ReplayError",
+    "Resident",
+    "TurnResult",
+    "WorldError",
+    "WorldEvent",
+    "WorldState",
+    "apply_proposal",
+    "initial_state",
+    "replay",
+    "run_offline_turn",
+    "world_state_item",
+]
